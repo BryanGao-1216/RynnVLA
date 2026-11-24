@@ -1,0 +1,33 @@
+{
+  "output_dir": "/gaowenbin/datasets/WETOP-Bench-Train-v30/rynn_latents",
+  "dataset_defaults": {
+    "state_key": "state",
+    "action_key": "action",
+    "cameras": {
+      "video.left_camera_view": "left_wrist",
+      "video.overlook_camera_view": "front_third",
+      "video.right_camera_view": "right_wrist",
+      "video.top_camera_view": "head"
+    }
+  },
+  "datasets": [
+    {"name": "task_03", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_03_magnetic_beaker_stirrer"},
+    {"name": "task_04", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_04_pour_liquid_with_funnel"}
+  ],
+  "rynnlam": {
+    "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",
+    "device": "cuda",
+    "precision": "bf16",
+    "batch_size": 4,
+    "representation": "ktoken_zcam",
+    "gap": 6,
+    "pair_stride": 6,
+    "normalization": "imagenet",
+    "bucket": "auto"
+  },
+  "rynnvla": {
+    "latent_action_dim": 608,
+    "latent_chunk": 6,
+    "latent_step_seconds": 0.25
+  }
+}
