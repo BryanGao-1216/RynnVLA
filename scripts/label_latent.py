@@ -45,7 +45,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rynnlam.inference import RynnLAMEncoder, file_sha256, implementation_sha256
-from rynnlam.video import BUCKETS, FrameReader, pair_batches, resolve_source
+from rynnlam.video import BUCKETS, FrameReader, VideoSeekError, pair_batches, resolve_source
 
 
 def safe_name(value, *, nested=False):
@@ -67,6 +67,14 @@ def safe_name(value, *, nested=False):
 
 def label_video(encoder, video, protocol, *, view, batch_size):
     """Encode every (t, t+gap) pair of one video; return (latent, pair_indices, meta)."""
+    try:
+        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size, seek=True)
+    except VideoSeekError as exc:
+        print(f"[decode] {video}: {exc}. Retrying the window with sequential decoding.", flush=True)
+        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size, seek=False)
+
+
+def _encode_video(encoder, video, protocol, *, view, batch_size, seek):
     reader = FrameReader(video, view)
     latents, pair_indices = [], []
     shape = bucket = native_hw = None
@@ -78,6 +86,7 @@ def label_video(encoder, video, protocol, *, view, batch_size):
         start=protocol["start_frame"],
         end=protocol["end_frame"],
         pair_stride=protocol["pair_stride"],
+        seek=seek,
     ):
         tokens = encoder(images, representation=protocol["representation"]).cpu().numpy()
         current = list(tokens.shape[1:])

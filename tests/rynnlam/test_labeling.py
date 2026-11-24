@@ -21,18 +21,22 @@ import rynnlam.video as video_module
 from rynnlam.video import FrameReader, pair_batches
 
 
-def write_video(path, n=9):
+def write_video(path, n=9, *, timestamps=None):
     import av
 
     with av.open(str(path), mode="w") as container:
         stream = container.add_stream("mpeg4", rate=30)
         stream.width, stream.height = 64, 48
         stream.pix_fmt = "yuv420p"
+        if timestamps is not None:
+            stream.gop_size = 6
+            stream.codec_context.max_b_frames = 2
         for i in range(n):
-            image = np.full((48, 64, 3), i * 20, dtype=np.uint8)
-            for packet in stream.encode(
-                av.VideoFrame.from_ndarray(image, format="rgb24")
-            ):
+            image = np.full((48, 64, 3), (i * 20) % 256, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(image, format="rgb24")
+            if timestamps is not None:
+                frame.pts = timestamps[i]
+            for packet in stream.encode(frame):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
@@ -262,6 +266,71 @@ def test_frame_reader_reports_exact_interval_length(tmp_path, start, end, expect
     frames = list(reader.frames(start=start, end=end))
     assert len(frames) == expected
     assert reader.num_frames == expected
+
+
+@pytest.mark.parametrize("constant_rate", [True, False])
+def test_sparse_mp4_window_matches_sequential_rgb(tmp_path, monkeypatch, constant_rate):
+    video = tmp_path / "shared.mp4"
+    timestamps = range(9, 39) if constant_rate else [i + 2 * (i >= 10) for i in range(30)]
+    write_video(video, n=30, timestamps=timestamps)
+    start, end = 12, 27
+    expected = list(FrameReader(video).frames(start, end))
+
+    first_indices = []
+    seek_frames = video_module._seek_video_frames
+
+    def track_first(*args):
+        frames = seek_frames(*args)
+        first = next(frames)
+        first_indices.append(first[0])
+        yield first
+        yield from frames
+
+    monkeypatch.setattr(video_module, "_seek_video_frames", track_first)
+    reader = FrameReader(video)
+    frames = list(reader.frames(start, end, rgb_filter=lambda index: index % 3 == 0, seek=True))
+    assert reader.num_frames == len(frames) == end - start
+    assert len(first_indices) == 1
+    assert (first_indices[0] > 0) == constant_rate
+    for index, frame in enumerate(frames):
+        if index % 3:
+            assert frame is None
+        else:
+            np.testing.assert_array_equal(frame, expected[index])
+
+    gap, stride = 2, 3
+    batches = list(pair_batches(FrameReader(video), gap=gap, pair_stride=stride,
+                                start=start, end=end, batch_size=2, seek=True))
+    indices = np.concatenate([batch[1] for batch in batches])
+    pair_starts = np.arange(0, end - start - gap, stride)
+    np.testing.assert_array_equal(indices, np.column_stack((pair_starts, pair_starts + gap)))
+    images = np.concatenate([batch[0] for batch in batches])
+    expected_pairs = np.asarray([[video_module.resize_crop(expected[index], (238, 322))
+                                  for index in pair] for pair in indices], dtype=np.float32) / 255.0
+    np.testing.assert_array_equal(images, expected_pairs)
+
+
+def test_labeler_retries_entire_window_after_seek_error(tmp_path, monkeypatch, capsys):
+    video = tmp_path / "shared.mp4"
+    write_video(video, n=30, timestamps=range(30))
+    protocol = {"gap": 2, "pair_stride": 2, "bucket": "4x3",
+                "start_frame": 12, "end_frame": 27, "representation": "ktoken"}
+    encoder = FakeEncoder()
+    expected = labeling._encode_video(encoder, video, protocol, view="head", batch_size=1, seek=False)
+    seek_frames = video_module._seek_video_frames
+
+    def fail_after_one_pair(*args):
+        for index, frame in seek_frames(*args):
+            if index == 15:
+                raise video_module.VideoSeekError("fixture timestamp error")
+            yield index, frame
+
+    monkeypatch.setattr(video_module, "_seek_video_frames", fail_after_one_pair)
+    latent, pairs, meta = labeling.label_video(encoder, video, protocol, view="head", batch_size=1)
+    np.testing.assert_array_equal(latent, expected[0])
+    np.testing.assert_array_equal(pairs, expected[1])
+    assert meta == expected[2]
+    assert "Retrying the window" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("stride", [0, -1])

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import struct
+from itertools import chain
 from pathlib import Path
 
 import cv2
@@ -187,6 +188,54 @@ def resolve_source(video_path, base=None):
     return str(path), stat.st_size, stat.st_mtime_ns
 
 
+class VideoSeekError(RuntimeError):
+    """A video window needs to be retried with sequential frame numbering."""
+
+
+def _seek_video_frames(container, stream, start, end):
+    """Seek on a constant-rate stream and verify the decoded presentation timestamps."""
+    import av
+
+    rate = stream.average_rate
+    time_base = stream.time_base
+    if not rate or not time_base or rate != stream.base_rate:
+        yield from enumerate(container.decode(stream))
+        return
+    frame_ticks = 1 / (rate * time_base)
+    if frame_ticks.denominator != 1 or not stream.frames or stream.duration != stream.frames * frame_ticks:
+        yield from enumerate(container.decode(stream))
+        return
+
+    frame_ticks = int(frame_ticks)
+    origin = stream.start_time or 0
+    try:
+        container.seek(origin + start * frame_ticks, stream=stream, any_frame=False, backward=True)
+        decoded = iter(container.decode(stream))
+        first = next(decoded, None)
+    except av.error.FFmpegError as exc:
+        raise VideoSeekError(f"could not seek to source frame {start}") from exc
+
+    if first is None or first.pts is None:
+        raise VideoSeekError(f"no timestamped frame returned when seeking to {start}")
+    first_index, remainder = divmod(first.pts - origin, frame_ticks)
+    if remainder or not 0 <= first_index <= start:
+        raise VideoSeekError(f"seek to {start} returned an unexpected first frame ({first.pts})")
+
+    next_index = first_index
+    try:
+        for index, frame in enumerate(chain((first,), decoded), first_index):
+            if frame.is_corrupt or frame.time_base != time_base or frame.pts != origin + index * frame_ticks:
+                raise VideoSeekError(f"unreliable frame or timestamp at source frame {index} after seek")
+            yield index, frame
+            next_index = index + 1
+            if end is not None and next_index >= end:
+                return
+    except av.error.FFmpegError as exc:
+        raise VideoSeekError(f"decode after seeking to source frame {start} failed") from exc
+    if end is not None and next_index < end:
+        raise VideoSeekError(f"decode after seeking reached frame {next_index} before the end ({end})")
+
+
 class FrameReader:
     def __init__(self, path, view="head"):
         self.source = str(path)
@@ -203,7 +252,8 @@ class FrameReader:
         else:
             self.backend = "av"
 
-    def frames(self, start=0, end=None):
+    def frames(self, start=0, end=None, *, rgb_filter=None, seek=False):
+        """Read a frame window. For local videos, skipped RGB conversions yield None."""
         if start < 0 or (end is not None and end <= start):
             raise ValueError("Expected a nonempty frame range with start >= 0")
         yielded = 0
@@ -249,12 +299,25 @@ class FrameReader:
             with av.open(str(self.path)) as container:
                 stream = container.streams.video[0]
                 self.fps = float(stream.average_rate) if stream.average_rate else None
-                for index, frame in enumerate(container.decode(video=0)):
+                if seek and start and self.path.suffix.lower() == ".mp4":
+                    decoded = _seek_video_frames(container, stream, start, end)
+                else:
+                    decoded = enumerate(container.decode(stream))
+                native_hw = None
+                for index, frame in decoded:
                     if index < start:
                         continue
                     if end is not None and index >= end:
                         break
                     yielded += 1
+                    if rgb_filter is not None:
+                        hw = (frame.height, frame.width)
+                        if native_hw is not None and hw != native_hw:
+                            raise ValueError("Frame resolution changed within the video")
+                        native_hw = hw
+                        if not rgb_filter(index - start):
+                            yield None
+                            continue
                     yield frame.to_ndarray(format="rgb24")
         if yielded == 0 or (end is not None and yielded != end - start):
             raise ValueError(
@@ -346,7 +409,7 @@ class FrameReader:
 
 
 def pair_batches(
-    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1
+    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *, seek=False
 ):
     if gap < 1 or batch_size < 1 or pair_stride < 1:
         raise ValueError("gap, batch_size and pair_stride must be positive")
@@ -356,14 +419,25 @@ def pair_batches(
     native_hw = target_hw = None
     chosen = bucket
     count = 0
-    for index, raw in enumerate(reader.frames(start, end)):
+    if isinstance(reader, FrameReader) and reader.backend == "av":
+        def needs_rgb(index):
+            source = index % pair_stride == 0 and (end is None or start + index + gap < end)
+            target = index >= gap and (index - gap) % pair_stride == 0
+            return source or target
+
+        frames = reader.frames(start, end, rgb_filter=needs_rgb, seek=seek)
+    else:
+        frames = reader.frames(start, end)
+    for index, raw in enumerate(frames):
+        count += 1
+        if raw is None:
+            continue
         if native_hw is None:
             native_hw = raw.shape[:2]
             chosen = pick_bucket(*native_hw) if bucket == "auto" else bucket
             target_hw = BUCKETS[chosen]
         elif raw.shape[:2] != native_hw:
             raise ValueError("Frame resolution changed within the video")
-        count += 1
         is_source = index % pair_stride == 0
         is_target = index >= gap and (index - gap) % pair_stride == 0
         if is_source:
