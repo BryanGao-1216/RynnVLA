@@ -33,6 +33,7 @@ against the current working directory, as they do everywhere else in this repo. 
 import argparse
 import io
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import sys
@@ -155,10 +156,13 @@ def npz_is_complete(path):
 
 def build_items(args):
     if args.metadata:
-        with args.metadata.open(encoding="utf-8") as handle:
-            items = json.load(handle)
-        if not isinstance(items, list):
-            raise SystemExit("--metadata must contain a JSON list of episode entries")
+        items = []
+        for path in args.metadata:
+            with path.open(encoding="utf-8") as handle:
+                entries = json.load(handle)
+            if not isinstance(entries, list):
+                raise SystemExit(f"{path}: --metadata must contain a JSON list of episode entries")
+            items.extend(entries)
         # Relative video_path values resolve against the current working directory, matching
         # the Stage-1 consumer (latent_pretrain.py) and every committed config/manifest in
         # this repo -- so run from the repo root, as documented in README.md.
@@ -171,15 +175,34 @@ def build_items(args):
     return [item], Path.cwd()
 
 
-def main(argv=None):
+def validate_latent_dim(meta, expected, path):
+    if expected is not None and meta.get("code_shape") != [expected]:
+        raise ValueError(f"{path}: expected latent shape [{expected}], got {meta.get('code_shape')}")
+
+
+def verify_existing_latent(path, protocol, expected_dim):
+    with np.load(path, allow_pickle=False) as archive:
+        meta = json.loads(archive["meta"].item())
+    validate_latent_dim(meta, expected_dim, path)
+    previous = meta.get("protocol") or {}
+    fields = ("checkpoint_sha256", "source", "source_size", "source_mtime_ns", "gap",
+              "pair_stride", "start_frame", "end_frame", "bucket", "normalization",
+              "representation", "precision", "expected_fps")
+    changed = [field for field in fields if previous.get(field) != protocol.get(field)]
+    if changed:
+        raise ValueError(f"{path}: existing latent differs in {', '.join(changed)}. "
+                         "Use --overwrite or choose a new output directory.")
+
+
+def main(argv=None, *, show_next_steps=True):
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--video", type=Path, help="One RGB video -> a single latent.npz")
     source.add_argument(
-        "--metadata", type=Path,
-        help="JSON list of {dataset, episode_id, views:{view:{video_path,...}}} entries",
+        "--metadata", type=Path, action="append",
+        help="JSON list of {dataset, episode_id, views:{view:{video_path,...}}} entries (repeatable)",
     )
     parser.add_argument("--checkpoint", required=True, type=Path,
                         help="Trained RynnLAM motion checkpoint (from scripts/train_rynnlam.py)")
@@ -201,12 +224,18 @@ def main(argv=None):
                         help="Override fps in meta when the container reports none")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-label even if the destination latent.npz already exists")
+    parser.add_argument("--verify-existing", action="store_true",
+                        help="Check a complete latent's labeling settings before reusing it")
+    parser.add_argument("--expected-latent-dim", type=int,
+                        help="Require a one-dimensional latent of this width")
     parser.add_argument("--trust-checkpoint", action="store_true",
                         help="Allow Python object deserialization; only for a trusted checkpoint")
     args = parser.parse_args(argv)
 
     if args.gap < 1 or args.pair_stride < 1 or args.batch_size < 1:
         parser.error("--gap, --pair-stride and --batch-size must be positive")
+    if args.expected_latent_dim is not None and args.expected_latent_dim < 1:
+        parser.error("--expected-latent-dim must be positive")
 
     items, base = build_items(args)
     checkpoint_hash = file_sha256(args.checkpoint)
@@ -236,15 +265,13 @@ def main(argv=None):
             if args.views and view not in args.views:
                 continue
             destination = args.output_dir / "latents" / dataset / episode / view / "latent.npz"
-            if destination.exists() and not args.overwrite:
-                if npz_is_complete(destination):
-                    print(f"[skip] {dataset}/{episode}/{view}: exists (use --overwrite)")
-                    skipped += 1
-                    continue
-                # Existence alone used to be the entire test, so a file truncated by an
-                # interrupted run was skipped forever and only surfaced much later as an
-                # `unreadable_latent` drop in rebuild_latent_manifest -- a silent hole in the
-                # corpus. Relabel it instead of trusting it.
+            exists = destination.exists() and not args.overwrite
+            complete = exists and npz_is_complete(destination)
+            if complete and not args.verify_existing and args.expected_latent_dim is None:
+                print(f"[skip] {dataset}/{episode}/{view}: exists (use --overwrite)")
+                skipped += 1
+                continue
+            if exists and not complete:
                 print(f"[relabel] {dataset}/{episode}/{view}: existing latent.npz is "
                       f"truncated or unreadable")
             video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
@@ -269,9 +296,23 @@ def main(argv=None):
                 "device": str(encoder.device),
                 "device_name": device_name,
             }
+            expected_fps = source_view.get("expected_fps")
+            if expected_fps is not None:
+                protocol["expected_fps"] = expected_fps
+            if complete:
+                verify_existing_latent(destination, protocol, args.expected_latent_dim)
+                print(f"[skip] {dataset}/{episode}/{view}: existing latent verified")
+                skipped += 1
+                continue
             latent, pairs, meta = label_video(
                 encoder, video, protocol, view=view, batch_size=args.batch_size
             )
+            validate_latent_dim(meta, args.expected_latent_dim, destination)
+            if expected_fps is not None:
+                if meta["fps"] and not math.isclose(meta["fps"], expected_fps, rel_tol=1e-3):
+                    raise ValueError(f"{video}: decoded fps {meta['fps']:g} differs from "
+                                     f"manifest fps {expected_fps:g}")
+                meta["fps"] = expected_fps
             if args.fps is not None and not meta.get("fps"):
                 meta["fps"] = args.fps
             write_npz(destination, latent, pairs, meta)
@@ -280,12 +321,14 @@ def main(argv=None):
                   f"shape={meta['code_shape']} -> {destination}", flush=True)
 
     latents = args.output_dir / "latents"
+    print(f"\n[label] wrote {labeled} latent.npz ({skipped} skipped) under {latents}")
+    if not show_next_steps:
+        return
     build = args.output_dir / "build"
     manifest = build / "manifests" / "corpus.jsonl"
     # --data-root is the directory holding the <Dataset>.json episode files, which is the
     # parent of --metadata when one was given.
-    data_root = args.metadata.parent if args.metadata else Path("<dir holding Dataset.json>")
-    print(f"\n[label] wrote {labeled} latent.npz ({skipped} skipped) under {latents}")
+    data_root = args.metadata[0].parent if args.metadata else Path("<dir holding Dataset.json>")
     print("[label] next -- build the Stage-1 index from these latents:")
     print(f"    python scripts/rebuild_latent_manifest.py --data-root {data_root} \\")
     print(f"        --latent-dir {latents} --out-dir {build} --name corpus --combine")

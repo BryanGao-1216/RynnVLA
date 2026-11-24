@@ -134,9 +134,9 @@ NUM_VIEW_SLOTS = len(VIEW_ROLES)  # K = 6
 # is what surfaced it.
 
 # Manifest camera name -> canonical role. The RynnVLA-Base dataset JSONs
-# (data/RynnVLA-Base/*.json) key their `views` dict by an already-normalised camera name;
-# a full scan of the pretraining corpus yields exactly these five names and at most five
-# cameras per episode, so this map is total over the corpus and the old `top` role never occurs.
+# (data/RynnVLA-Base/*.json) key their `views` dict by an already-normalised camera name.
+# The pretraining corpus uses the first five names. Custom manifests can also specify
+# the right-side role explicitly.
 #
 # This map is injective, so no episode can collide here. That is a property of THIS table,
 # not of the role axis: a many-to-one table can collide, and
@@ -152,6 +152,7 @@ VIEW_NAME_TO_ROLE = {
     "wrist_right": "right_wrist",
     "global": "front_third",
     "side": "side_left",
+    "side_right": "side_right",
 }
 
 # Short human-readable camera label, used when the prompt carries an explicit camera tag

@@ -8,6 +8,7 @@ These cover the shared machinery ``scripts/label_latent.py`` is built on --
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -67,6 +68,88 @@ def test_unsafe_identifiers():
     for value in ["../escape", "/absolute", "", "..", "bad\\path"]:
         with pytest.raises(ValueError):
             labeling.safe_name(value, nested=True)
+
+
+def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    adapter = load_script("label_lerobot_v3")
+    monkeypatch.setitem(sys.modules, "label_latent", labeling)
+
+    class VectorEncoder(FakeEncoder):
+        calls = 0
+        device = torch.device("cpu")
+
+        def __call__(self, images, representation):
+            self.__class__.calls += 1
+            return torch.from_numpy(images).mean((1, 2, 3, 4))[:, None].expand(-1, 608)
+
+    monkeypatch.setattr(labeling, "RynnLAMEncoder", VectorEncoder)
+    root = tmp_path / "dataset"
+    cameras = {"observation.images.front": "front_third", "observation.images.wrist": "left_wrist"}
+    template = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    rows = [{"episode_index": i, "length": 5, "tasks": [f"Task {i}"]} for i in range(2)]
+    for offset, key in enumerate(cameras):
+        path = root / template.format(video_key=key, chunk_index=1, file_index=2)
+        path.parent.mkdir(parents=True)
+        write_video(path, n=11)
+        for index, row in enumerate(rows):
+            start = index * 5 + offset
+            prefix = f"videos/{key}/"
+            row.update({prefix + "chunk_index": 1, prefix + "file_index": 2,
+                        prefix + "from_timestamp": start / 30, prefix + "to_timestamp": (start + 5) / 30})
+    episodes = root / "meta" / "episodes" / "chunk-000"
+    episodes.mkdir(parents=True)
+    for index, row in enumerate(rows):
+        pq.write_table(pa.Table.from_pylist([row]), episodes / f"file-{index:03d}.parquet")
+    (root / "meta" / "info.json").write_text(json.dumps({
+        "codebase_version": "v3.0", "fps": 30, "video_path": template,
+        "features": {**{key: {"dtype": "video"} for key in cameras},
+                     "custom.state": {"dtype": "float32"}, "custom.action": {"dtype": "float32"}},
+    }))
+
+    checkpoint = tmp_path / "RynnLAM.pt"
+    checkpoint.write_bytes(b"fixture")
+    config = {
+        "output_dir": "out",
+        "dataset_defaults": {"cameras": cameras, "state_key": "custom.state", "action_key": "custom.action"},
+        "datasets": [{"name": name, "path": "dataset", "episode_indices": [1]} for name in ("first", "second")],
+        "rynnlam": {"checkpoint": checkpoint.name, "device": "cpu", "precision": "fp32", "batch_size": 4,
+                    "representation": "ktoken_zcam", "gap": 2, "pair_stride": 2,
+                    "normalization": "imagenet", "bucket": "auto"},
+        "rynnvla": {"latent_action_dim": 608, "latent_chunk": 2, "latent_step_seconds": 2 / 30},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config))
+    args = ["--config", str(config_path)]
+    adapter.main(args + ["--prepare-only"])
+    out = tmp_path / "out"
+    item, = json.loads((out / "source/first.json").read_text())
+    assert item["caption"] == "Task 1"
+    assert item["views"]["global"]["start_frame"] == 5
+    assert item["views"]["wrist_left"]["start_frame"] == 6
+    assert VectorEncoder.calls == 0
+
+    adapter.main(args)
+    assert len(list((out / "latents").rglob("latent.npz"))) == 4
+    with np.load(out / "latents/second/1/wrist_left/latent.npz", allow_pickle=False) as data:
+        np.testing.assert_array_equal(data["pair_indices"], [[0, 2], [2, 4]])
+        assert data["latent_action"].shape == (2, 608)
+        assert data["latent_action"][0, 0] == pytest.approx(140 / 255, abs=0.02)
+        meta = json.loads(data["meta"].item())
+        assert meta["protocol"]["end_frame"] == 11
+        assert meta["num_frames"] == 5
+    assert VectorEncoder.calls == 4
+    adapter.main(args)
+    assert VectorEncoder.calls == 4
+
+    config["rynnlam"]["gap"] = 1
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="existing latent differs in gap"):
+        adapter.main(args)
+    adapter.main(args + ["--overwrite"])
+    assert VectorEncoder.calls == 8
 
 
 class DummyReader:

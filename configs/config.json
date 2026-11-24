@@ -1,0 +1,35 @@
+{
+  "output_dir": "../outputs/lerobot_v3_latents",
+  "dataset_defaults": {
+    "state_key": "observation.state",
+    "action_key": "action",
+    "cameras": {
+      "observation.images.head": "front_third",
+      "observation.images.wrist": "left_wrist"
+    }
+  },
+  "datasets": [
+    {"name": "level3_pick", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_pick_200_absolute_flange"},
+    {"name": "level3_pour", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_pour_200_absolute_flange"},
+    {"name": "level3_open", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_open_200_absolute_flange"},
+    {"name": "level3_press", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_press_200_absolute_flange"},
+    {"name": "level3_heat", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_heat_200_absolute_flange"},
+    {"name": "level3_transport", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_transport_200_absolute_flange"}
+  ],
+  "rynnlam": {
+    "checkpoint": "../checkpoints/RynnLAM.pt",
+    "device": "cuda",
+    "precision": "bf16",
+    "batch_size": 32,
+    "representation": "ktoken_zcam",
+    "gap": 4,
+    "pair_stride": 4,
+    "normalization": "imagenet",
+    "bucket": "auto"
+  },
+  "rynnvla": {
+    "latent_action_dim": 608,
+    "latent_chunk": 6,
+    "latent_step_seconds": 0.25
+  }
+}
