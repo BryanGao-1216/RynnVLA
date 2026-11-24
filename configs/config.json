@@ -21,16 +21,13 @@
     {"name": "task_08", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_08_place_container_in_oven"},
     {"name": "task_09", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_09_solid_weighing"},
     {"name": "task_10", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_10_titration_experiment"},
-    {"name": "task_11", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_11_remove_container_from_oven"},
-    {"name": "task_12", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_12_fehling_test"},
-    {"name": "task_13", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_13_blue_bottle_reaction"},
-    {"name": "task_14", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_14_fixed_weight_weighing"}
+    {"name": "task_11", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_11_remove_container_from_oven"}
   ],
   "rynnlam": {
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",
     "device": "cuda",
     "precision": "bf16",
-    "batch_size": 1,
+    "batch_size": 4,
     "representation": "ktoken_zcam",
     "gap": 6,
     "pair_stride": 6,
