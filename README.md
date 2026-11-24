@@ -83,14 +83,16 @@ The `stage1` / `stage2` presets differ mainly in initialization source, action c
 
 ### Label a local LeRobot v3 dataset
 
-Set the dataset roots, feature keys, camera roles, and RynnLAM checkpoint in [`configs/config.json`](configs/config.json). Relative paths are resolved from the config file's directory. The supplied config points to the six LabUtopia Level 3 subsets in the sibling `Datasets` directory. Each entry inherits `dataset_defaults` and can override its keys or select an `episode_indices` list.
+Set the dataset roots, feature keys, camera roles, and RynnLAM checkpoint in [`configs/config.json`](configs/config.json). Each entry inherits `dataset_defaults` and can override its keys or select an `episode_indices` list. Relative paths inside the JSON are resolved from the config file's directory.
 
 ```bash
 bash scripts/label_lerobot_v3.sh --prepare-only
 bash scripts/label_lerobot_v3.sh
 ```
 
-Pass `--config /path/to/config.json` to use another config. `--prepare-only` checks the episode metadata and writes `source/<subset>.json` without loading the checkpoint. A full run reads the configured MP4 windows and writes `latents/<subset>/<episode>/<view>/latent.npz` under `output_dir`. Existing labels are checked for compatible settings before reuse. Pass `--overwrite` to regenerate them.
+Edit `config_path` at the top of [`scripts/label_lerobot_v3.sh`](scripts/label_lerobot_v3.sh) to set the default. It accepts an absolute path or a path relative to the repository root. Run `bash scripts/label_lerobot_v3.sh --config configs/config-1.json` to select another file for a single run from the repository root.
+
+`--prepare-only` checks the episode metadata and writes `source/<subset>.json` without loading the checkpoint. A full run reads the configured MP4 windows and writes `latents/<subset>/<episode>/<view>/latent.npz` under `output_dir`. Existing labels are checked for compatible settings before reuse. Pass `--overwrite` to regenerate them.
 
 The `state_key` and `action_key` fields are checked against the dataset schema. Label extraction uses the configured RGB videos. The `rynnvla` settings check the latent width and report how many episodes fit a Stage 1 chunk. Use the same `latent_chunk` and `latent_step_seconds` when building the training index.
 
