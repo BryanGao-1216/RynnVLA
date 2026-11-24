@@ -1,29 +1,39 @@
 {
-  "output_dir": "../outputs/lerobot_v3_latents",
+  "output_dir": "/gaowenbin/datasets/WETOP-Bench-Train-v30/rynn_latents",
   "dataset_defaults": {
-    "state_key": "observation.state",
+    "state_key": "state",
     "action_key": "action",
     "cameras": {
-      "observation.images.head": "front_third",
-      "observation.images.wrist": "left_wrist"
+      "video.left_camera_view": "left_wrist",
+      "video.overlook_camera_view": "front_third",
+      "video.right_camera_view": "right_wrist",
+      "video.top_camera_view": "head"
     }
   },
   "datasets": [
-    {"name": "level3_pick", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_pick_200_absolute_flange"},
-    {"name": "level3_pour", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_pour_200_absolute_flange"},
-    {"name": "level3_open", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_open_200_absolute_flange"},
-    {"name": "level3_press", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_press_200_absolute_flange"},
-    {"name": "level3_heat", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_heat_200_absolute_flange"},
-    {"name": "level3_transport", "path": "../../Datasets/labutopia_level3_absolute_eef_1200/level3_transport_200_absolute_flange"}
+    {"name": "task_01", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_01_pour_flask_to_cylinder"},
+    {"name": "task_02", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_02_pour_liquid_and_stir"},
+    {"name": "task_03", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_03_magnetic_beaker_stirrer"},
+    {"name": "task_04", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_04_pour_liquid_with_funnel"},
+    {"name": "task_05", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_05_remove_container_lid"},
+    {"name": "task_06", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_06_remove_centrifuge_tubes"},
+    {"name": "task_07", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_07_insert_centrifuge_tubes"},
+    {"name": "task_08", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_08_place_container_in_oven"},
+    {"name": "task_09", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_09_solid_weighing"},
+    {"name": "task_10", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_10_titration_experiment"},
+    {"name": "task_11", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_11_remove_container_from_oven"},
+    {"name": "task_12", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_12_fehling_test"},
+    {"name": "task_13", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_13_blue_bottle_reaction"},
+    {"name": "task_14", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_14_fixed_weight_weighing"}
   ],
   "rynnlam": {
-    "checkpoint": "../checkpoints/RynnLAM.pt",
+    "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",
     "device": "cuda",
     "precision": "bf16",
-    "batch_size": 32,
+    "batch_size": 1,
     "representation": "ktoken_zcam",
-    "gap": 4,
-    "pair_stride": 4,
+    "gap": 6,
+    "pair_stride": 6,
     "normalization": "imagenet",
     "bucket": "auto"
   },
