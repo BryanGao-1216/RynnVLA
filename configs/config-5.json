@@ -18,7 +18,7 @@
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",
     "device": "cuda",
     "precision": "bf16",
-    "batch_size": 4,
+    "batch_size": 32,
     "representation": "ktoken_zcam",
     "gap": 6,
     "pair_stride": 6,
