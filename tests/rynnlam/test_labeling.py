@@ -89,7 +89,11 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
 
     class VectorEncoder(FakeEncoder):
         calls = 0
+        loads = 0
         device = torch.device("cpu")
+
+        def __init__(self, *args, **kwargs):
+            self.__class__.loads += 1
 
         def __call__(self, images, representation, *, mark=None):
             assert current_thread() is main_thread()
@@ -173,6 +177,7 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     assert VectorEncoder.calls == 4
     adapter.main(args)
     assert VectorEncoder.calls == 4
+    assert VectorEncoder.loads == 1
     report = capsys.readouterr().out
     assert "[timing:batch]" not in report
     assert "labeled=0 skipped=4 pairs=0" in report
@@ -194,6 +199,66 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
             with np.load(path, allow_pickle=False) as actual, np.load(serial, allow_pickle=False) as expected:
                 for field in ("latent_action", "pair_indices", "meta"):
                     np.testing.assert_array_equal(actual[field], expected[field])
+
+
+def test_resume_completes_current_episode_before_next_prefetch(tmp_path, monkeypatch, capsys):
+    class ResumeEncoder(FakeEncoder):
+        device = torch.device("cpu")
+
+        def __call__(self, images, representation, *, mark=None):
+            return super().__call__(images, representation)
+
+    monkeypatch.setattr(labeling, "RynnLAMEncoder", ResumeEncoder)
+    checkpoint = tmp_path / "checkpoint.pt"
+    checkpoint.write_bytes(b"fixture")
+    views = ("wrist_left", "global", "wrist_right", "head")
+    items = []
+    for episode in (160, 161):
+        video = tmp_path / f"{episode}.mp4"
+        write_video(video)
+        items.append({"dataset": "task_01", "episode_id": episode,
+                      "views": {view: {"video_path": str(video)} for view in views}})
+    full, first = tmp_path / "full.json", tmp_path / "first.json"
+    full.write_text(json.dumps(items))
+    first.write_text(json.dumps(items[:1]))
+    output = tmp_path / "out"
+    options = ["--checkpoint", str(checkpoint), "--output-dir", str(output), "--verify-existing",
+               "--device", "cpu", "--precision", "fp32", "--batch-size", "2"]
+    labeling.main(options + ["--metadata", str(first), "--views", "wrist_left", "wrist_right", "head"])
+    capsys.readouterr()
+
+    episode_dir = output / "latents/task_01/160"
+    preserved = {}
+    for view in ("wrist_left", "head"):
+        path = episode_dir / view / "latent.npz"
+        preserved[path] = path.read_bytes(), path.stat().st_mtime_ns
+    incomplete = episode_dir / "wrist_right/latent.npz"
+    with np.load(incomplete, allow_pickle=False) as archive:
+        labels, indices, metadata = archive["latent_action"], archive["pair_indices"], archive["meta"]
+    np.savez(incomplete, latent_action=labels, pair_indices=indices[:-1], meta=metadata)
+    assert labeling.read_complete_latent(incomplete) is None
+
+    video_batches = labeling._video_batches
+    scheduled = []
+
+    def check_before_prefetch(video, protocol, view, *args, **kwargs):
+        episode = Path(video).stem
+        if episode == "161":
+            assert all(labeling.read_complete_latent(episode_dir / name / "latent.npz") for name in views)
+        scheduled.append((episode, view))
+        return video_batches(video, protocol, view, *args, **kwargs)
+
+    monkeypatch.setattr(labeling, "_video_batches", check_before_prefetch)
+    monkeypatch.setattr(labeling, "implementation_sha256", lambda: "new-code-revision")
+    labeling.main(options + ["--metadata", str(full), "--prefetch-workers", "4"])
+    assert scheduled == [("160", "global"), ("160", "wrist_right"), *(("161", view) for view in views)]
+    for path, (payload, mtime) in preserved.items():
+        assert path.read_bytes() == payload
+        assert path.stat().st_mtime_ns == mtime
+    report = capsys.readouterr().out
+    assert "[episode] task_01/160 pending_views=global,wrist_right" in report
+    assert "[relabel] task_01/160/wrist_right" in report
+    assert "labeled=6 skipped=2" in report
 
 
 class DummyReader:

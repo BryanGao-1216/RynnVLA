@@ -33,7 +33,7 @@ against the current working directory, as they do everywhere else in this repo. 
 import argparse
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass
 import io
 import json
@@ -210,7 +210,7 @@ def write_npz(destination, latent, pairs, meta, *, timings=None):
     The bytes land in a ``.partial`` sibling and are published with ``os.replace``, so this
     writer can never leave a half-written file at the final path -- not for its own skip check
     on a rerun, and not for a ``rebuild_latent_manifest`` sweep running while labeling is still
-    in progress. ``npz_is_complete`` is the second layer, covering files truncated by something
+    in progress. ``read_complete_latent`` is the second layer, covering files truncated by something
     other than this function. Not imported from ``stream_extract_tar.atomic_write`` because that
     module pulls in cv2 and torch at import time, which the labeler does not otherwise need.
     """
@@ -228,24 +228,50 @@ def write_npz(destination, latent, pairs, meta, *, timings=None):
             pending.unlink(missing_ok=True)
 
 
-def npz_is_complete(path):
-    """Cheap truncation probe for an existing ``latent.npz``.
+def _has_label_array(archive, member, shape, dtype):
+    entry = archive.getinfo(member)
+    with archive.open(entry) as stream:
+        version = np.lib.format.read_magic(stream)
+        if version == (1, 0):
+            actual_shape, _, actual_dtype = np.lib.format.read_array_header_1_0(stream)
+        elif version == (2, 0):
+            actual_shape, _, actual_dtype = np.lib.format.read_array_header_2_0(stream)
+        else:
+            return False
+        return (actual_shape == shape and actual_dtype.newbyteorder("=") == dtype
+                and entry.file_size == stream.tell() + math.prod(shape) * actual_dtype.itemsize)
 
-    Constructing a ``ZipFile`` reads only the End-Of-Central-Directory record at the tail, so
-    this costs one small read rather than the whole payload -- the same reason
-    ``rebuild_latent_manifest.read_npz_meta`` reads a tail window. A truncated file raises
-    ``BadZipFile``, which subclasses ``Exception`` directly and is therefore caught by neither
-    ``OSError`` nor ``ValueError``; naming it explicitly is the whole point.
 
-    The member is ``latent_action.npy``, not ``latent_action``: ``np.savez`` appends ``.npy`` to
-    every key, so testing for the bare array name would report every healthy file as corrupt and
-    relabel the whole corpus on each run.
-    """
+def read_complete_latent(path):
+    """Check the stored window and array headers without loading all latent values."""
     try:
         with zipfile.ZipFile(path) as archive:
-            return "latent_action.npy" in archive.namelist()
-    except (OSError, ValueError, zipfile.BadZipFile):
-        return False
+            with archive.open("meta.npy") as stream:
+                meta = json.loads(np.lib.format.read_array(stream, allow_pickle=False).item())
+            count, code_shape = meta["num_latents"], meta["code_shape"]
+            protocol = meta["protocol"]
+            if (type(count) is not int or count < 1 or not isinstance(code_shape, list)
+                    or not code_shape or any(type(dim) is not int or dim < 1 for dim in code_shape)
+                    or not isinstance(protocol, dict)):
+                return None
+            frames = meta.get("num_frames")
+            if protocol.get("end_frame") is not None:
+                window_frames = protocol["end_frame"] - protocol.get("start_frame", 0)
+                if frames is not None and frames != window_frames:
+                    return None
+                frames = window_frames
+            if frames is not None:
+                gap, stride = protocol.get("gap"), protocol.get("pair_stride")
+                if (type(frames) is not int or type(gap) is not int or gap < 1
+                        or type(stride) is not int or stride < 1
+                        or count != 1 + (frames - gap - 1) // stride):
+                    return None
+            if (_has_label_array(archive, "latent_action.npy", (count, math.prod(code_shape)), np.float16)
+                    and _has_label_array(archive, "pair_indices.npy", (count, 2), np.int32)):
+                return meta
+    except (FileNotFoundError, EOFError, KeyError, TypeError, ValueError, zipfile.BadZipFile):
+        pass
+    return None
 
 
 def build_items(args):
@@ -274,9 +300,7 @@ def validate_latent_dim(meta, expected, path):
         raise ValueError(f"{path}: expected latent shape [{expected}], got {meta.get('code_shape')}")
 
 
-def verify_existing_latent(path, protocol, expected_dim):
-    with np.load(path, allow_pickle=False) as archive:
-        meta = json.loads(archive["meta"].item())
+def verify_existing_latent(path, meta, protocol, expected_dim):
     validate_latent_dim(meta, expected_dim, path)
     previous = meta.get("protocol") or {}
     fields = ("checkpoint_sha256", "source", "source_size", "source_mtime_ns", "gap",
@@ -302,7 +326,7 @@ class LabelWindow:
     destination: Path
     protocol: dict
     timings: Counter
-    started: float
+    scan_wall: float
 
 
 def _report_skip(name, timings, started, totals, counts, *, verified):
@@ -312,88 +336,100 @@ def _report_skip(name, timings, started, totals, counts, *, verified):
     counts["skipped"] += 1
 
 
-def _pending_windows(items, base, args, protocol_defaults, totals, counts):
+def _pending_episode(item, base, args, protocol_defaults, totals, counts):
+    dataset = safe_name(item["dataset"])
+    episode = safe_name(item["episode_id"], nested=True)
+    windows = []
     verify = args.verify_existing or args.expected_latent_dim is not None
-    for item in items:
-        dataset = safe_name(item["dataset"])
-        episode = safe_name(item["episode_id"], nested=True)
-        for view, source_view in item["views"].items():
-            safe_name(view)
-            if args.views and view not in args.views:
-                continue
-            started = perf_counter()
-            timings = Counter()
-            name = f"{dataset}/{episode}/{view}"
-            destination = args.output_dir / "latents" / dataset / episode / view / "latent.npz"
-            with timed(timings, "probe_output"):
-                exists = destination.exists() and not args.overwrite
-                complete = exists and npz_is_complete(destination)
-            if complete and not verify:
-                _report_skip(name, timings, started, totals, counts, verified=False)
-                continue
-            if exists and not complete:
-                print(f"[relabel] {name}: existing latent.npz is truncated or unreadable", flush=True)
-            with timed(timings, "resolve_source"):
-                video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
-            start = int(source_view.get("start_frame", item.get("start_frame", 0)) or 0)
-            end = source_view.get("end_frame", item.get("end_frame"))
-            protocol = {
-                **protocol_defaults,
-                "source": str(video), "source_size": source_size, "source_mtime_ns": source_mtime_ns,
-                "start_frame": start, "end_frame": int(end) if end is not None else None,
-            }
-            expected_fps = source_view.get("expected_fps")
-            if expected_fps is not None:
-                protocol["expected_fps"] = expected_fps
-            if complete:
-                with timed(timings, "verify_existing"):
-                    verify_existing_latent(destination, protocol, args.expected_latent_dim)
-                _report_skip(name, timings, started, totals, counts, verified=True)
-                continue
-            yield LabelWindow(name, view, destination, protocol, timings, started)
+    for view, source_view in item["views"].items():
+        safe_name(view)
+        if args.views and view not in args.views:
+            continue
+        started = perf_counter()
+        timings = Counter()
+        name = f"{dataset}/{episode}/{view}"
+        destination = args.output_dir / "latents" / dataset / episode / view / "latent.npz"
+        with timed(timings, "probe_output"):
+            exists = not args.overwrite and destination.exists()
+            existing = read_complete_latent(destination) if exists else None
+        if existing is not None and not verify:
+            _report_skip(name, timings, started, totals, counts, verified=False)
+            continue
+        if exists and existing is None:
+            print(f"[relabel] {name}: existing latent.npz is incomplete or unreadable", flush=True)
+        with timed(timings, "resolve_source"):
+            video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
+        start = int(source_view.get("start_frame", item.get("start_frame", 0)) or 0)
+        end = source_view.get("end_frame", item.get("end_frame"))
+        protocol = {
+            **protocol_defaults,
+            "source": str(video), "source_size": source_size, "source_mtime_ns": source_mtime_ns,
+            "start_frame": start, "end_frame": int(end) if end is not None else None,
+        }
+        expected_fps = source_view.get("expected_fps")
+        if expected_fps is not None:
+            protocol["expected_fps"] = expected_fps
+        if existing is not None:
+            with timed(timings, "verify_existing"):
+                verify_existing_latent(destination, existing, protocol, args.expected_latent_dim)
+            _report_skip(name, timings, started, totals, counts, verified=True)
+            continue
+        windows.append(LabelWindow(name, view, destination, protocol, timings, perf_counter() - started))
+    if windows:
+        print(f"[episode] {dataset}/{episode} pending_views={','.join(window.view for window in windows)}", flush=True)
+    return windows
 
 
-def _prepared_windows(windows, workers, batch_size):
+def _prepared_windows(windows, executor, workers, batch_size):
     if not workers:
         for window in windows:
-            yield window, None, False
+            yield window, None
         return
 
+    windows = iter(windows)
     pending = deque()
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rynnlam-prep") as executor:
+    try:
         exhausted = False
-        try:
-            while pending or not exhausted:
-                while not exhausted and len(pending) < workers:
-                    window = next(windows, None)
-                    if window is None:
-                        exhausted = True
-                        break
-                    # Repeated metadata entries must see the earlier window's published output
-                    # before encoding, just as they do in the serial path.
-                    repeated = any(window.destination == job.destination for job, _, _ in pending)
-                    if repeated:
-                        pending.append((window, None, True))
-                        continue
-                    producer_timings = Counter()
-                    reader, batches = _video_batches(
-                        window.protocol["source"], window.protocol, window.view, batch_size,
-                        True, producer_timings, buffer_count=PrefetchedBatches.buffer_count,
-                    )
-                    prefetch = PrefetchedBatches()
-                    # Register before launching so an interrupt always cancels the worker.
-                    pending.append((window, (reader, prefetch), False))
-                    prefetch.start(executor, batches, producer_timings)
-                if pending:
-                    yield pending[0]
-                    _, prepared, _ = pending.popleft()
-                    if prepared is not None:
-                        prepared[1].close()
-        finally:
-            # Cancel blocked producers before the executor waits for its threads to finish.
-            for _, prepared, _ in pending:
-                if prepared is not None:
-                    prepared[1].close()
+        while pending or not exhausted:
+            while not exhausted and len(pending) < workers:
+                window = next(windows, None)
+                if window is None:
+                    exhausted = True
+                    break
+                producer_timings = Counter()
+                reader, batches = _video_batches(
+                    window.protocol["source"], window.protocol, window.view, batch_size,
+                    True, producer_timings, buffer_count=PrefetchedBatches.buffer_count,
+                )
+                prefetch = PrefetchedBatches()
+                # Register before launching so an interrupt always cancels the worker.
+                pending.append((window, (reader, prefetch)))
+                prefetch.start(executor, batches, producer_timings)
+            if pending:
+                yield pending[0]
+                _, prepared = pending.popleft()
+                prepared[1].close()
+    finally:
+        # Cancel blocked producers before the executor waits for its threads to finish.
+        for _, prepared in pending:
+            prepared[1].close()
+
+
+def _episode_jobs(items, base, args, protocol_defaults, totals, counts):
+    workers = args.prefetch_workers
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rynnlam-prep") if workers else nullcontext()
+    with pool as executor:
+        for item in items:
+            windows = _pending_episode(item, base, args, protocol_defaults, totals, counts)
+            with closing(_prepared_windows(windows, executor, workers, args.batch_size)) as jobs:
+                yield from jobs
+
+
+def _report_setup(args, device, item_count, setup):
+    clock = "cuda_stream" if device.type == "cuda" else "wall"
+    print(f"[timing:setup] pid={os.getpid()} device={device} inference_clock={clock} "
+          f"batch_size={args.batch_size} prefetch_workers={args.prefetch_workers} episodes={item_count} "
+          f"{format_timings(setup, SETUP_TIMING_STAGES)}", flush=True)
 
 
 def main(argv=None, *, show_next_steps=True):
@@ -456,27 +492,9 @@ def main(argv=None, *, show_next_steps=True):
     with timed(setup, "implementation_hash"):
         implementation_hash = implementation_sha256()
         labeler_hash = file_sha256(Path(__file__).resolve())
-    with timed(setup, "load_model"):
-        encoder = RynnLAMEncoder(
-            args.checkpoint, device=args.device,
-            normalize=args.normalization == "imagenet", precision=args.precision,
-            trust_checkpoint=args.trust_checkpoint, checkpoint_sha256=checkpoint_hash,
-        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Recorded rather than left to be inferred from the bytes, because it cannot be: bf16 matmul
-    # is hardware-dependent, so the same checkpoint at the same --precision produces different
-    # bits on different GPUs. The logical device alone ("cuda:0") does not say which silicon did
-    # the work, hence the name beside it. This is provenance, not geometry -- the bytes and their
-    # meaning are unchanged, so schema_version stays at 2.
-    device_name = (torch.cuda.get_device_name()
-                   if encoder.device.type == "cuda" else "cpu")
-    clock = "cuda_stream" if encoder.device.type == "cuda" else "wall"
-    print(f"[timing:setup] pid={os.getpid()} device={encoder.device} inference_clock={clock} "
-          f"batch_size={args.batch_size} prefetch_workers={args.prefetch_workers} episodes={len(items)} "
-          f"{format_timings(setup, SETUP_TIMING_STAGES)}",
-          flush=True)
-
+    device = torch.device(args.device)
+    encoder = None
     counts = Counter()
     totals = Counter()
     protocol_defaults = {
@@ -484,24 +502,26 @@ def main(argv=None, *, show_next_steps=True):
         "implementation_sha256": implementation_hash, "labeler_sha256": labeler_hash,
         "gap": args.gap, "pair_stride": args.pair_stride, "bucket": args.bucket,
         "normalization": args.normalization, "representation": args.representation,
-        "precision": args.precision, "device": str(encoder.device), "device_name": device_name,
+        "precision": args.precision, "device": str(device),
     }
-    windows = _pending_windows(items, base, args, protocol_defaults, totals, counts)
-    with closing(_prepared_windows(windows, args.prefetch_workers, args.batch_size)) as jobs:
-        for window, prepared, repeated in jobs:
-            window_started = perf_counter() if args.prefetch_workers else window.started
+    with closing(_episode_jobs(items, base, args, protocol_defaults, totals, counts)) as jobs:
+        for window, prepared in jobs:
+            if encoder is None:
+                with timed(setup, "load_model"):
+                    encoder = RynnLAMEncoder(
+                        args.checkpoint, device=args.device,
+                        normalize=args.normalization == "imagenet", precision=args.precision,
+                        trust_checkpoint=args.trust_checkpoint, checkpoint_sha256=checkpoint_hash,
+                    )
+                # Equal checkpoints can produce slightly different bf16 results on different GPUs.
+                device_name = (torch.cuda.get_device_name(encoder.device)
+                               if encoder.device.type == "cuda" else "cpu")
+                _report_setup(args, encoder.device, len(items), setup)
+            # Count the scan for this view, excluding model loading and earlier views.
+            window_started = perf_counter() - window.scan_wall
             timings = window.timings
             protocol = window.protocol
-            if repeated and not args.overwrite:
-                with timed(timings, "probe_output"):
-                    complete = npz_is_complete(window.destination)
-                if complete:
-                    verify = args.verify_existing or args.expected_latent_dim is not None
-                    if verify:
-                        with timed(timings, "verify_existing"):
-                            verify_existing_latent(window.destination, protocol, args.expected_latent_dim)
-                    _report_skip(window.name, timings, window_started, totals, counts, verified=verify)
-                    continue
+            protocol["device_name"] = device_name
             latent, pairs, meta = label_video(
                 encoder, protocol["source"], protocol, view=window.view, batch_size=args.batch_size,
                 timings=timings, timing_every=args.timing_every, label_name=window.name, prepared=prepared,
@@ -525,6 +545,8 @@ def main(argv=None, *, show_next_steps=True):
                   f"pairs={meta['num_latents']} wall={wall:.3f}s pairs_per_s={meta['num_latents'] / wall:.2f} "
                   f"{format_timings(timings, VIEW_TIMING_STAGES)}", flush=True)
 
+    if encoder is None:
+        _report_setup(args, device, len(items), setup)
     latents = args.output_dir / "latents"
     wall = perf_counter() - run_started
     labeled, skipped, total_pairs = (counts[name] for name in ("labeled", "skipped", "pairs"))
