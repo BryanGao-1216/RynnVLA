@@ -10,6 +10,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .timing import timed
+
 BUCKETS = {"square": (280, 280), "4x3": (238, 322), "16x9": (210, 364)}
 
 _ROVIDX_PREFIX = "rovidx_tar://"
@@ -192,25 +194,39 @@ class VideoSeekError(RuntimeError):
     """A video window needs to be retried with sequential frame numbering."""
 
 
-def _seek_video_frames(container, stream, start, end):
+def _decode_frames(container, stream, timings):
+    frames = iter(container.decode(stream))
+    if timings is None:
+        yield from frames
+        return
+    while True:
+        with timed(timings, "decode"):
+            frame = next(frames, None)
+        if frame is None:
+            return
+        yield frame
+
+
+def _seek_video_frames(container, stream, start, end, timings=None):
     """Seek on a constant-rate stream and verify the decoded presentation timestamps."""
     import av
 
     rate = stream.average_rate
     time_base = stream.time_base
     if not rate or not time_base or rate != stream.base_rate:
-        yield from enumerate(container.decode(stream))
+        yield from enumerate(_decode_frames(container, stream, timings))
         return
     frame_ticks = 1 / (rate * time_base)
     if frame_ticks.denominator != 1 or not stream.frames or stream.duration != stream.frames * frame_ticks:
-        yield from enumerate(container.decode(stream))
+        yield from enumerate(_decode_frames(container, stream, timings))
         return
 
     frame_ticks = int(frame_ticks)
     origin = stream.start_time or 0
     try:
-        container.seek(origin + start * frame_ticks, stream=stream, any_frame=False, backward=True)
-        decoded = iter(container.decode(stream))
+        with timed(timings, "seek"):
+            container.seek(origin + start * frame_ticks, stream=stream, any_frame=False, backward=True)
+        decoded = _decode_frames(container, stream, timings)
         first = next(decoded, None)
     except av.error.FFmpegError as exc:
         raise VideoSeekError(f"could not seek to source frame {start}") from exc
@@ -252,7 +268,7 @@ class FrameReader:
         else:
             self.backend = "av"
 
-    def frames(self, start=0, end=None, *, rgb_filter=None, seek=False):
+    def frames(self, start=0, end=None, *, rgb_filter=None, seek=False, timings=None):
         """Read a frame window. For local videos, skipped RGB conversions yield None."""
         if start < 0 or (end is not None and end <= start):
             raise ValueError("Expected a nonempty frame range with start >= 0")
@@ -262,47 +278,61 @@ class FrameReader:
 
             import av
 
-            with av.open(io.BytesIO(_rovidx_read_bytes(self.source))) as container:
+            with timed(timings, "open_video"):
+                container = av.open(io.BytesIO(_rovidx_read_bytes(self.source)))
+            with container:
                 stream = container.streams.video[0]
                 self.fps = float(stream.average_rate) if stream.average_rate else None
-                for index, frame in enumerate(container.decode(video=0)):
+                for index, frame in enumerate(_decode_frames(container, stream, timings)):
                     if index < start:
                         continue
                     if end is not None and index >= end:
                         break
                     yielded += 1
-                    yield frame.to_ndarray(format="rgb24")
+                    with timed(timings, "rgb"):
+                        rgb = frame.to_ndarray(format="rgb24")
+                    yield rgb
         elif self.backend == "zarr":
             import zarr
 
-            array = self._open_zarr_array(zarr)
-            total = array.shape[0]
+            with timed(timings, "open_video"):
+                array = self._open_zarr_array(zarr)
+                total = array.shape[0]
             for index in range(
                 start, min(end, total) if end is not None else total
             ):
                 yielded += 1
-                yield _decode_encoded_frame(array[index])
+                with timed(timings, "decode"):
+                    rgb = _decode_encoded_frame(array[index])
+                yield rgb
         elif self.backend == "hdf5":
             import h5py
 
             # OSS/FUSE does not support POSIX file locking -> locking=False.
-            with h5py.File(str(self.path), "r", locking=False) as handle:
-                dataset = self._open_hdf5_dataset(handle)
-                total = len(dataset)
+            with timed(timings, "open_video"):
+                handle = h5py.File(str(self.path), "r", locking=False)
+            with handle:
+                with timed(timings, "open_video"):
+                    dataset = self._open_hdf5_dataset(handle)
+                    total = len(dataset)
                 stop = min(end, total) if end is not None else total
                 for index in range(start, stop):
                     yielded += 1
-                    yield _decode_encoded_frame(dataset[index])
+                    with timed(timings, "decode"):
+                        rgb = _decode_encoded_frame(dataset[index])
+                    yield rgb
         else:
             import av
 
-            with av.open(str(self.path)) as container:
+            with timed(timings, "open_video"):
+                container = av.open(str(self.path))
+            with container:
                 stream = container.streams.video[0]
                 self.fps = float(stream.average_rate) if stream.average_rate else None
                 if seek and start and self.path.suffix.lower() == ".mp4":
-                    decoded = _seek_video_frames(container, stream, start, end)
+                    decoded = _seek_video_frames(container, stream, start, end, timings)
                 else:
-                    decoded = enumerate(container.decode(stream))
+                    decoded = enumerate(_decode_frames(container, stream, timings))
                 native_hw = None
                 for index, frame in decoded:
                     if index < start:
@@ -318,7 +348,9 @@ class FrameReader:
                         if not rgb_filter(index - start):
                             yield None
                             continue
-                    yield frame.to_ndarray(format="rgb24")
+                    with timed(timings, "rgb"):
+                        rgb = frame.to_ndarray(format="rgb24")
+                    yield rgb
         if yielded == 0 or (end is not None and yielded != end - start):
             raise ValueError(
                 f"Decoded {yielded} frames, incomplete interval [{start}, {end}) from {self.path}"
@@ -409,7 +441,7 @@ class FrameReader:
 
 
 def pair_batches(
-    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *, seek=False
+    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *, seek=False, timings=None
 ):
     if gap < 1 or batch_size < 1 or pair_stride < 1:
         raise ValueError("gap, batch_size and pair_stride must be positive")
@@ -425,7 +457,9 @@ def pair_batches(
             target = index >= gap and (index - gap) % pair_stride == 0
             return source or target
 
-        frames = reader.frames(start, end, rgb_filter=needs_rgb, seek=seek)
+        frames = reader.frames(start, end, rgb_filter=needs_rgb, seek=seek, timings=timings)
+    elif isinstance(reader, FrameReader):
+        frames = reader.frames(start, end, timings=timings)
     else:
         frames = reader.frames(start, end)
     for index, raw in enumerate(frames):
@@ -446,17 +480,23 @@ def pair_batches(
             continue
         source_index = index - gap
         source_raw, source_frame = sources.pop(source_index)
-        if source_frame is None:
-            source_frame = resize_crop(source_raw, target_hw).astype(np.float32) / 255.0
-        frame = resize_crop(raw, target_hw).astype(np.float32) / 255.0
+        with timed(timings, "resize"):
+            if source_frame is None:
+                source_frame = resize_crop(source_raw, target_hw).astype(np.float32) / 255.0
+            frame = resize_crop(raw, target_hw).astype(np.float32) / 255.0
         if is_source:
             sources[index] = (None, frame)
-        pairs.append(np.stack([source_frame, frame]))
-        indices.append((source_index, index))
+        with timed(timings, "pack_batch"):
+            pairs.append(np.stack([source_frame, frame]))
+            indices.append((source_index, index))
         if len(pairs) == batch_size:
-            yield np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw
+            with timed(timings, "pack_batch"):
+                batch = (np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw)
+            yield batch
             pairs, indices = [], []
     if count <= gap:
         raise ValueError(f"Video interval has {count} frames, but gap={gap}")
     if pairs:
-        yield np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw
+        with timed(timings, "pack_batch"):
+            batch = (np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw)
+        yield batch

@@ -74,7 +74,7 @@ def test_unsafe_identifiers():
             labeling.safe_name(value, nested=True)
 
 
-def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch):
+def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, capsys):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -85,8 +85,11 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch):
         calls = 0
         device = torch.device("cpu")
 
-        def __call__(self, images, representation):
+        def __call__(self, images, representation, *, mark=None):
             self.__class__.calls += 1
+            for stage in ("transfer_in", "input_check", "forward", "readout"):
+                if mark is not None:
+                    mark(stage)
             return torch.from_numpy(images).mean((1, 2, 3, 4))[:, None].expand(-1, 608)
 
     monkeypatch.setattr(labeling, "RynnLAMEncoder", VectorEncoder)
@@ -134,8 +137,18 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch):
     assert item["views"]["global"]["start_frame"] == 5
     assert item["views"]["wrist_left"]["start_frame"] == 6
     assert VectorEncoder.calls == 0
+    assert "[timing:prepare]" in capsys.readouterr().out
 
-    adapter.main(args)
+    adapter.main(args + ["--timing-every", "1"])
+    report = capsys.readouterr().out.splitlines()
+    assert any(line.startswith("[timing:setup]") and "inference_clock=wall" in line for line in report)
+    batches = [line for line in report if line.startswith("[timing:batch]")]
+    views = [line for line in report if line.startswith("[timing:view]")]
+    assert len(batches) == len(views) == 4
+    assert all("batch=1 pairs=2" in line and "forward=" in line for line in batches)
+    assert all(all(f"{stage}=" in line for stage in labeling.VIEW_TIMING_STAGES) for line in views)
+    assert any(line.startswith("[timing:total]") and "labeled=4 skipped=0 pairs=8" in line for line in report)
+    assert any(line.startswith("[timing:job]") and "import_labeler=" in line for line in report)
     assert len(list((out / "latents").rglob("latent.npz"))) == 4
     with np.load(out / "latents/second/1/wrist_left/latent.npz", allow_pickle=False) as data:
         np.testing.assert_array_equal(data["pair_indices"], [[0, 2], [2, 4]])
@@ -147,6 +160,10 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch):
     assert VectorEncoder.calls == 4
     adapter.main(args)
     assert VectorEncoder.calls == 4
+    report = capsys.readouterr().out
+    assert "[timing:batch]" not in report
+    assert "labeled=0 skipped=4 pairs=0" in report
+    assert "verify_existing=" in report
 
     config["rynnlam"]["gap"] = 1
     config_path.write_text(json.dumps(config))

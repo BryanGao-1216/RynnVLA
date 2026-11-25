@@ -2,17 +2,20 @@
 """Prepare episode manifests for local LeRobot v3 videos and run the RynnLAM labeler."""
 
 import argparse
+from collections import Counter
 import json
 import math
 from pathlib import Path
 import sys
 from tempfile import NamedTemporaryFile
+from time import perf_counter
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from rynnvla.constants import VIEW_NAME_TO_ROLE
 from rynnvla.utils.manifest_io import join_caption
+from rynnlam.timing import format_timings, timed
 
 MANIFEST_VIEW = {role: name for name, role in VIEW_NAME_TO_ROLE.items()}
 VIDEO_POINTER_FIELDS = ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
@@ -134,13 +137,20 @@ def write_manifest(path, items):
 
 
 def main(argv=None):
+    started = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs/config.json")
     parser.add_argument("--prepare-only", action="store_true", help="Write manifests without loading RynnLAM")
     parser.add_argument("--overwrite", action="store_true", help="Re-encode existing latent files")
+    parser.add_argument("--timing-every", type=int, default=0, metavar="N",
+                        help="Also print interval timings every N batches per video (0: video summaries only)")
     args = parser.parse_args(argv)
+    if args.timing_every < 0:
+        parser.error("--timing-every must be nonnegative")
     config_path = args.config.resolve()
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    timings = Counter()
+    with timed(timings, "read_config"):
+        config = json.loads(config_path.read_text(encoding="utf-8"))
     config_dir = config_path.parent
     output = resolve_path(config_dir, config["output_dir"])
     label_options = config["rynnlam"]
@@ -170,29 +180,41 @@ def main(argv=None):
                 or "/" in name or "\\" in name or "," in name or name in manifests):
             parser.error(f"Each dataset needs a unique name that is a path component: {name!r}")
         root = resolve_path(config_dir, dataset["path"])
+        dataset_started = perf_counter()
         manifests[name] = prepare_dataset(root, dataset, gap=gap, pair_stride=pair_stride,
                                          latent_chunk=latent_chunk, latent_step_seconds=step_seconds)
+        elapsed = perf_counter() - dataset_started
+        timings["dataset_metadata"] += elapsed
+        print(f"[timing:dataset] {name} dataset_metadata={elapsed:.3f}s", flush=True)
 
     source_dir = output / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
     label_args = ["--checkpoint", str(checkpoint), "--output-dir", str(output),
                   "--expected-latent-dim", str(latent_dim), "--verify-existing"]
-    for name, items in manifests.items():
-        path = source_dir / f"{name}.json"
-        write_manifest(path, items)
-        label_args.extend(("--metadata", str(path)))
+    with timed(timings, "write_manifests"):
+        for name, items in manifests.items():
+            path = source_dir / f"{name}.json"
+            write_manifest(path, items)
+            label_args.extend(("--metadata", str(path)))
     print(f"Wrote episode manifests to {source_dir}", flush=True)
+    print(f"[timing:prepare] wall={perf_counter() - started:.3f}s "
+          f"{format_timings(timings, ('read_config', 'dataset_metadata', 'write_manifests'))}", flush=True)
     if args.prepare_only:
         return
 
-    from label_latent import main as label
+    with timed(timings, "import_labeler"):
+        from label_latent import main as label
 
     for option in ("device", "precision", "batch_size", "representation", "gap", "pair_stride",
                    "normalization", "bucket"):
         label_args.extend(("--" + option.replace("_", "-"), str(label_options[option])))
     if args.overwrite:
         label_args.append("--overwrite")
+    if args.timing_every:
+        label_args.extend(("--timing-every", str(args.timing_every)))
     label(label_args, show_next_steps=False)
+    print(f"[timing:job] wall={perf_counter() - started:.3f}s "
+          f"{format_timings(timings, ('import_labeler',))}", flush=True)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ def test_checkpoint_roundtrip_and_strict_load(tmp_path, monkeypatch):
     images = np.random.default_rng(7).random((1, 2, 28, 28, 3), dtype=np.float32)
     expected = model.encode_pair(torch.from_numpy(images))["k_tokens"]
     torch.testing.assert_close(encoder(images), expected)
+    marks = []
+    torch.testing.assert_close(encoder(images, mark=marks.append), expected)
+    assert marks == ["transfer_in", "input_check", "forward", "readout"]
     assert encoder(images, "z").shape == (1, 64)
     assert encoder(images, "zcam").shape == (1, 96)
     assert encoder(images, "hints_pool").shape == (1, 128)

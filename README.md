@@ -94,6 +94,8 @@ Edit `config_path` at the top of [`scripts/label_lerobot_v3.sh`](scripts/label_l
 
 `--prepare-only` checks the episode metadata and writes `source/<subset>.json` without loading the checkpoint. A full run reads the configured MP4 windows and writes `latents/<subset>/<episode>/<view>/latent.npz` under `output_dir`. Existing labels are checked for compatible settings before reuse. Pass `--overwrite` to regenerate them.
 
+The labeler reports timings for setup, each episode view, and the full run. Pass `--timing-every 1` to print every batch, or `--timing-every N` to report each group of N batches. The view report separates video open, seek, decode, RGB conversion, resize, batch packing, inference, and NPZ serialization and write. `encode_wall` includes input preparation, inference, and the copy back to CPU. In CUDA mode the finer inference fields use CUDA stream events.
+
 The `state_key` and `action_key` fields are checked against the dataset schema. Label extraction uses the configured RGB videos. The `rynnvla` settings check the latent width and report how many episodes fit a Stage 1 chunk. Use the same `latent_chunk` and `latent_step_seconds` when building the training index.
 
 ### Launch Commands
