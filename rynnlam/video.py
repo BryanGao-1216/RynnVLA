@@ -441,13 +441,18 @@ class FrameReader:
 
 
 def pair_batches(
-    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *, seek=False, timings=None
+    reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *,
+    seek=False, timings=None, reuse_buffer=False,
 ):
+    """Yield RGB batches and frame indices. With reuse enabled, consume images before advancing."""
     if gap < 1 or batch_size < 1 or pair_stride < 1:
         raise ValueError("gap, batch_size and pair_stride must be positive")
     if bucket != "auto" and bucket not in BUCKETS:
         raise ValueError(f"Unknown bucket {bucket}")
-    sources, pairs, indices = {}, [], []
+    sources, indices = {}, []
+    batch_images = None
+    # Without a known end, a short video may fill only a fraction of a large batch.
+    capacity = min(batch_size, 8) if end is None else batch_size
     native_hw = target_hw = None
     chosen = bucket
     count = 0
@@ -486,17 +491,32 @@ def pair_batches(
             frame = resize_crop(raw, target_hw).astype(np.float32) / 255.0
         if is_source:
             sources[index] = (None, frame)
-        with timed(timings, "pack_batch"):
-            pairs.append(np.stack([source_frame, frame]))
+        with timed(timings, "pack_batch", cpu_stage="pack_batch_cpu"):
+            slot = len(indices)
+            if batch_images is None:
+                if end is not None:
+                    remaining_pairs = 1 + (end - start - index - 1) // pair_stride
+                    capacity = min(batch_size, remaining_pairs)
+                batch_images = np.empty((capacity, 2, *target_hw, 3), dtype=np.float32)
+            elif slot == len(batch_images):
+                capacity = min(batch_size, 2 * capacity)
+                expanded = np.empty((capacity, *batch_images.shape[1:]), dtype=batch_images.dtype)
+                expanded[:slot] = batch_images
+                batch_images = expanded
+                del expanded
+            batch_images[slot, 0] = source_frame
+            batch_images[slot, 1] = frame
             indices.append((source_index, index))
-        if len(pairs) == batch_size:
-            with timed(timings, "pack_batch"):
-                batch = (np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw)
-            yield batch
-            pairs, indices = [], []
+        if len(indices) == batch_size:
+            with timed(timings, "pack_batch", cpu_stage="pack_batch_cpu"):
+                pair_indices = np.asarray(indices, dtype=np.int32)
+            yield batch_images, pair_indices, chosen, native_hw
+            indices = []
+            if not reuse_buffer:
+                batch_images = None
     if count <= gap:
         raise ValueError(f"Video interval has {count} frames, but gap={gap}")
-    if pairs:
-        with timed(timings, "pack_batch"):
-            batch = (np.stack(pairs), np.asarray(indices, dtype=np.int32), chosen, native_hw)
-        yield batch
+    if indices:
+        with timed(timings, "pack_batch", cpu_stage="pack_batch_cpu"):
+            pair_indices = np.asarray(indices, dtype=np.int32)
+        yield batch_images[:len(indices)], pair_indices, chosen, native_hw

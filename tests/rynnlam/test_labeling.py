@@ -7,6 +7,7 @@ These cover the shared machinery ``scripts/label_latent.py`` is built on --
 """
 
 import json
+from collections import Counter
 from pathlib import Path
 import sys
 
@@ -218,6 +219,35 @@ def test_sparse_pair_lengths(n, expected_count, tiny_buckets):
     assert pairs[-1, 1] < n
     assert all(len(batch[0]) == 5 for batch in batches[:-1])
     assert len(batches[-1][0]) == (expected_count - 1) % 5 + 1
+
+
+@pytest.mark.parametrize("end", [None, 97])
+def test_batch_buffer_reuse_keeps_input_values_and_independent_indices(end, tiny_buckets):
+    options = dict(gap=4, pair_stride=4, batch_size=10, end=end)
+    expected = list(pair_batches(DummyReader(97), **options))
+    assert [len(batch[0]) for batch in expected] == [10, 10, 4]
+    assert not np.shares_memory(expected[0][0], expected[1][0])
+
+    timings = Counter()
+    reusable_images = []
+    saved_indices = []
+    actual = pair_batches(DummyReader(97), **options, timings=timings, reuse_buffer=True)
+    for (images, indices, bucket, hw), (expected_images, expected_indices, *geometry) in zip(
+        actual, expected, strict=True,
+    ):
+        np.testing.assert_array_equal(images, expected_images)
+        np.testing.assert_array_equal(indices, expected_indices)
+        assert (images.dtype, indices.dtype) == (np.float32, np.int32)
+        assert images.flags.c_contiguous
+        assert [bucket, hw] == geometry
+        reusable_images.append(images)
+        saved_indices.append(indices)
+
+    assert all(np.shares_memory(reusable_images[0], images) for images in reusable_images[1:])
+    for indices, batch in zip(saved_indices, expected, strict=True):
+        np.testing.assert_array_equal(indices, batch[1])
+    assert timings["pack_batch"] > 0
+    assert timings["pack_batch_cpu"] > 0
 
 
 @pytest.mark.parametrize("gap", [4, 5])

@@ -51,7 +51,7 @@ from rynnlam.timing import format_timings, timed
 from rynnlam.video import BUCKETS, FrameReader, VideoSeekError, pair_batches, resolve_source
 
 BATCH_TIMING_STAGES = (
-    "open_video", "seek", "decode", "rgb", "resize", "pack_batch",
+    "open_video", "seek", "decode", "rgb", "resize", "pack_batch", "pack_batch_cpu",
     "transfer_in", "input_check", "forward", "readout", "transfer_out", "encode_wall", "latent_post",
 )
 VIEW_TIMING_STAGES = (
@@ -140,6 +140,8 @@ def _encode_video(encoder, video, protocol, *, view, batch_size, seek,
         pair_stride=protocol["pair_stride"],
         seek=seek,
         timings=timings,
+        # _encode_batch transfers the result to CPU before we request another batch.
+        reuse_buffer=True,
     )
     for batch_number, (images, pairs, bkt, nhw) in enumerate(batches, 1):
         tokens = _encode_batch(encoder, images, protocol["representation"], timings)
