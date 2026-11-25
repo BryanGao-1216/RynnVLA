@@ -11,8 +11,7 @@
     }
   },
   "datasets": [
-    {"name": "task_05", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_05_remove_container_lid"},
-    {"name": "task_06", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_06_remove_centrifuge_tubes"}
+    {"name": "task_03", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_03_magnetic_beaker_stirrer"}
   ],
   "rynnlam": {
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",

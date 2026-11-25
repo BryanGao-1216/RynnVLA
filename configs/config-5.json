@@ -11,8 +11,7 @@
     }
   },
   "datasets": [
-    {"name": "task_09", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_09_solid_weighing"},
-    {"name": "task_10", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_10_titration_experiment"}
+    {"name": "task_05", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_05_remove_container_lid"}
   ],
   "rynnlam": {
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",

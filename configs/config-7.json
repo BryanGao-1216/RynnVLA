@@ -11,8 +11,7 @@
     }
   },
   "datasets": [
-    {"name": "task_13", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_13_blue_bottle_reaction"},
-    {"name": "task_14", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_14_fixed_weight_weighing"}
+    {"name": "task_07", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_07_insert_centrifuge_tubes"}
   ],
   "rynnlam": {
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",

@@ -11,8 +11,7 @@
     }
   },
   "datasets": [
-    {"name": "task_07", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_07_insert_centrifuge_tubes"},
-    {"name": "task_08", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_08_place_container_in_oven"}
+    {"name": "task_04", "path": "/gaowenbin/datasets/WETOP-Bench-Train-v30/task_04_pour_liquid_with_funnel"}
   ],
   "rynnlam": {
     "checkpoint": "/gaowenbin/models/base_models/LAM/RynnLAM/RynnLAM.pt",
