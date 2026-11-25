@@ -154,6 +154,12 @@ def main(argv=None):
     config_dir = config_path.parent
     output = resolve_path(config_dir, config["output_dir"])
     label_options = config["rynnlam"]
+    async_prefetch = label_options.get("async_prefetch", False)
+    prefetch_workers = label_options.get("prefetch_workers", 1)
+    if type(async_prefetch) is not bool:
+        parser.error("rynnlam.async_prefetch must be true or false")
+    if type(prefetch_workers) is not int or prefetch_workers < 1:
+        parser.error("rynnlam.prefetch_workers must be a positive integer")
     checkpoint = resolve_path(config_dir, label_options["checkpoint"])
     if not args.prepare_only and not checkpoint.is_file():
         parser.error(f"RynnLAM checkpoint not found: {checkpoint}")
@@ -212,6 +218,8 @@ def main(argv=None):
         label_args.append("--overwrite")
     if args.timing_every:
         label_args.extend(("--timing-every", str(args.timing_every)))
+    if async_prefetch:
+        label_args.extend(("--prefetch-workers", str(prefetch_workers)))
     label(label_args, show_next_steps=False)
     print(f"[timing:job] wall={perf_counter() - started:.3f}s "
           f"{format_timings(timings, ('import_labeler',))}", flush=True)

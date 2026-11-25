@@ -96,6 +96,8 @@ Edit `config_path` at the top of [`scripts/label_lerobot_v3.sh`](scripts/label_l
 
 The labeler reports timings for setup, each episode view, and the full run. Pass `--timing-every 1` to print every batch, or `--timing-every N` to report each group of N batches. The view report separates video open, seek, decode, RGB conversion, resize, batch packing, inference, and NPZ serialization and write. `pack_batch_cpu` reports labeling-thread CPU time within the same intervals measured by `pack_batch` wall time. `encode_wall` includes input preparation, inference, and the copy back to CPU. In CUDA mode the finer inference fields use CUDA stream events.
 
+Set `rynnlam.async_prefetch` to `true` and `rynnlam.prefetch_workers` to a positive integer to overlap CPU frame preparation with inference. One worker prepares the next batch during inference, and additional workers also prepare upcoming video windows. Each active worker uses up to two batch image buffers. Inference and output publication follow manifest order. Set `async_prefetch` to `false` to use serial preparation. The `prefetch_wait` field measures the inference thread's wait for prepared batches. Compare whole-job throughput across modes because preparation can overlap both inference and other workers.
+
 The `state_key` and `action_key` fields are checked against the dataset schema. Label extraction uses the configured RGB videos. The `rynnvla` settings check the latent width and report how many episodes fit a Stage 1 chunk. Use the same `latent_chunk` and `latent_step_seconds` when building the training index.
 
 ### Launch Commands

@@ -8,8 +8,11 @@ These cover the shared machinery ``scripts/label_latent.py`` is built on --
 
 import json
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 import sys
+from threading import Event, current_thread, main_thread
 
 import numpy as np
 import pytest
@@ -18,6 +21,7 @@ import torch
 from _scripts import load_script
 
 labeling = load_script("label_latent")
+from rynnlam.prefetch import PrefetchedBatches
 import rynnlam.video as video_module
 from rynnlam.video import FrameReader, pair_batches
 
@@ -75,7 +79,8 @@ def test_unsafe_identifiers():
             labeling.safe_name(value, nested=True)
 
 
-def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("workers", [0, 2])
+def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, capsys, workers):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -87,6 +92,7 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
         device = torch.device("cpu")
 
         def __call__(self, images, representation, *, mark=None):
+            assert current_thread() is main_thread()
             self.__class__.calls += 1
             for stage in ("transfer_in", "input_check", "forward", "readout"):
                 if mark is not None:
@@ -128,6 +134,8 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
                     "normalization": "imagenet", "bucket": "auto"},
         "rynnvla": {"latent_action_dim": 608, "latent_chunk": 2, "latent_step_seconds": 2 / 30},
     }
+    if workers:
+        config["rynnlam"].update(async_prefetch=True, prefetch_workers=workers)
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     args = ["--config", str(config_path)]
@@ -142,10 +150,14 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
 
     adapter.main(args + ["--timing-every", "1"])
     report = capsys.readouterr().out.splitlines()
-    assert any(line.startswith("[timing:setup]") and "inference_clock=wall" in line for line in report)
+    assert any(line.startswith("[timing:setup]") and "inference_clock=wall" in line
+               and f"prefetch_workers={workers}" in line for line in report)
     batches = [line for line in report if line.startswith("[timing:batch]")]
     views = [line for line in report if line.startswith("[timing:view]")]
     assert len(batches) == len(views) == 4
+    assert [line.split()[1] for line in views] == [
+        "first/1/global", "first/1/wrist_left", "second/1/global", "second/1/wrist_left",
+    ]
     assert all("batch=1 pairs=2" in line and "forward=" in line for line in batches)
     assert all(all(f"{stage}=" in line for stage in labeling.VIEW_TIMING_STAGES) for line in views)
     assert any(line.startswith("[timing:total]") and "labeled=4 skipped=0 pairs=8" in line for line in report)
@@ -172,6 +184,16 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
         adapter.main(args)
     adapter.main(args + ["--overwrite"])
     assert VectorEncoder.calls == 8
+    if workers:
+        config["rynnlam"]["async_prefetch"] = False
+        config["output_dir"] = "serial"
+        config_path.write_text(json.dumps(config))
+        adapter.main(args)
+        for path in (out / "latents").rglob("latent.npz"):
+            serial = tmp_path / "serial" / path.relative_to(out)
+            with np.load(path, allow_pickle=False) as actual, np.load(serial, allow_pickle=False) as expected:
+                for field in ("latent_action", "pair_indices", "meta"):
+                    np.testing.assert_array_equal(actual[field], expected[field])
 
 
 class DummyReader:
@@ -248,6 +270,38 @@ def test_batch_buffer_reuse_keeps_input_values_and_independent_indices(end, tiny
         np.testing.assert_array_equal(indices, batch[1])
     assert timings["pack_batch"] > 0
     assert timings["pack_batch_cpu"] > 0
+
+
+def test_prefetch_overlaps_with_consumer_without_overwriting_held_batch(tiny_buckets):
+    second_ready = Event()
+    worker_closed = Event()
+    opts = dict(gap=4, pair_stride=4, batch_size=2, end=30)
+    expected = list(pair_batches(DummyReader(30), **opts))
+
+    def batches():
+        try:
+            for batch_index, batch in enumerate(pair_batches(
+                    DummyReader(30), **opts, reuse_buffer=True, buffer_count=PrefetchedBatches.buffer_count)):
+                assert current_thread() is not main_thread()
+                if batch_index == 1:
+                    second_ready.set()
+                yield batch
+        finally:
+            worker_closed.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with closing(PrefetchedBatches()) as prepared, closing(prepared.consume(Counter())) as stream:
+            prepared.start(executor, batches(), Counter())
+            first = next(stream)
+            assert second_ready.wait(timeout=3)
+            np.testing.assert_array_equal(first[0], expected[0][0])
+            second = next(stream)
+            np.testing.assert_array_equal(second[0], expected[1][0])
+            third = next(stream)
+            np.testing.assert_array_equal(third[0], expected[2][0])
+            assert np.shares_memory(first[0], third[0])
+            assert not np.shares_memory(second[0], third[0])
+        assert worker_closed.wait(timeout=3)
 
 
 @pytest.mark.parametrize("gap", [4, 5])
@@ -357,7 +411,8 @@ def test_sparse_mp4_window_matches_sequential_rgb(tmp_path, monkeypatch, constan
     np.testing.assert_array_equal(images, expected_pairs)
 
 
-def test_labeler_retries_entire_window_after_seek_error(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("with_prefetch", [False, True])
+def test_labeler_retries_entire_window_after_seek_error(tmp_path, monkeypatch, capsys, with_prefetch):
     video = tmp_path / "shared.mp4"
     write_video(video, n=30, timestamps=range(30))
     protocol = {"gap": 2, "pair_stride": 2, "bucket": "4x3",
@@ -373,7 +428,18 @@ def test_labeler_retries_entire_window_after_seek_error(tmp_path, monkeypatch, c
             yield index, frame
 
     monkeypatch.setattr(video_module, "_seek_video_frames", fail_after_one_pair)
-    latent, pairs, meta = labeling.label_video(encoder, video, protocol, view="head", batch_size=1)
+    if with_prefetch:
+        producer_timings = Counter()
+        reader, batches = labeling._video_batches(video, protocol, "head", 1, True, producer_timings,
+                                                 buffer_count=PrefetchedBatches.buffer_count)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with closing(PrefetchedBatches()) as prefetch:
+                prefetch.start(executor, batches, producer_timings)
+                latent, pairs, meta = labeling.label_video(
+                    encoder, video, protocol, view="head", batch_size=1, prepared=(reader, prefetch),
+                )
+    else:
+        latent, pairs, meta = labeling.label_video(encoder, video, protocol, view="head", batch_size=1)
     np.testing.assert_array_equal(latent, expected[0])
     np.testing.assert_array_equal(pairs, expected[1])
     assert meta == expected[2]

@@ -31,6 +31,8 @@
     "device": "cuda",
     "precision": "bf16",
     "batch_size": 4,
+    "async_prefetch": false,
+    "prefetch_workers": 1,
     "representation": "ktoken_zcam",
     "gap": 6,
     "pair_stride": 6,

@@ -1,5 +1,6 @@
 """Frame-accurate RGB decoding and aspect-preserving input geometry."""
 
+from collections import deque
 import json
 import math
 import os
@@ -442,14 +443,17 @@ class FrameReader:
 
 def pair_batches(
     reader, gap=5, batch_size=16, bucket="auto", start=0, end=None, pair_stride=1, *,
-    seek=False, timings=None, reuse_buffer=False,
+    seek=False, timings=None, reuse_buffer=False, buffer_count=1,
 ):
-    """Yield RGB batches and frame indices. With reuse enabled, consume images before advancing."""
+    """Yield RGB batches and indices, optionally rotating through reusable image buffers."""
     if gap < 1 or batch_size < 1 or pair_stride < 1:
         raise ValueError("gap, batch_size and pair_stride must be positive")
     if bucket != "auto" and bucket not in BUCKETS:
         raise ValueError(f"Unknown bucket {bucket}")
+    if buffer_count < 1:
+        raise ValueError("buffer_count must be positive")
     sources, indices = {}, []
+    buffers = deque([None] * buffer_count) if reuse_buffer else None
     batch_images = None
     # Without a known end, a short video may fill only a fraction of a large batch.
     capacity = min(batch_size, 8) if end is None else batch_size
@@ -512,8 +516,12 @@ def pair_batches(
                 pair_indices = np.asarray(indices, dtype=np.int32)
             yield batch_images, pair_indices, chosen, native_hw
             indices = []
-            if not reuse_buffer:
+            if buffers is None:
                 batch_images = None
+            else:
+                buffers.popleft()
+                buffers.append(batch_images)
+                batch_images = buffers[0]
     if count <= gap:
         raise ValueError(f"Video interval has {count} frames, but gap={gap}")
     if indices:
