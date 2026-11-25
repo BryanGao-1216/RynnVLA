@@ -89,18 +89,12 @@ class RynnLAMEncoder:
         )
 
     @torch.inference_mode()
-    def __call__(self, images, representation="ktoken", *, mark=None):
-        if mark is not None:
-            mark("transfer_in")
+    def __call__(self, images, representation="ktoken"):
         images = torch.as_tensor(images, dtype=torch.float32, device=self.device)
-        if mark is not None:
-            mark("input_check")
         if images.ndim != 5 or images.shape[1] != 2 or images.shape[-1] != 3:
             raise ValueError("Expected RGB images [batch, 2, height, width, 3]")
         if not torch.isfinite(images).all() or images.min() < 0 or images.max() > 1:
             raise ValueError("RGB images must be finite floats in [0, 1]")
-        if mark is not None:
-            mark("forward")
         context = (
             torch.autocast("cuda", dtype=torch.bfloat16)
             if self.device.type == "cuda" and self.precision == "bf16"
@@ -108,8 +102,6 @@ class RynnLAMEncoder:
         )
         with context:
             features = self.model.encode_pair(images, normalize=self.normalize)
-        if mark is not None:
-            mark("readout")
         z, camera, hints = (
             features["latent_action"],
             features["camera_pose_latent"],

@@ -4,8 +4,6 @@ from contextlib import closing
 from queue import Queue
 from threading import Event, Semaphore
 
-from .timing import timed
-
 
 class PrefetchedBatches:
     """Advance a batch iterator on a worker, with two image buffers in flight."""
@@ -17,10 +15,10 @@ class PrefetchedBatches:
         self._available = Semaphore(self.buffer_count)
         self._stopped = Event()
 
-    def start(self, executor, batches, producer_timings):
-        executor.submit(self._produce, batches, producer_timings)
+    def start(self, executor, batches):
+        executor.submit(self._produce, batches)
 
-    def _produce(self, batches, timings):
+    def _produce(self, batches):
         try:
             with closing(batches):
                 while True:
@@ -32,19 +30,15 @@ class PrefetchedBatches:
                     batch = next(batches, None)
                     if batch is None:
                         break
-                    self._queue.put((batch, timings.copy(), None))
-                    timings.clear()
+                    self._queue.put((batch, None))
         except BaseException as exc:
-            self._queue.put((None, timings.copy(), exc))
+            self._queue.put((None, exc))
         else:
-            self._queue.put((None, timings.copy(), None))
+            self._queue.put((None, None))
 
-    def consume(self, timings):
+    def consume(self):
         while True:
-            with timed(timings, "prefetch_wait"):
-                batch, deltas, error = self._queue.get()
-            if timings is not None:
-                timings.update(deltas)
+            batch, error = self._queue.get()
             if error is not None:
                 raise error
             if batch is None:

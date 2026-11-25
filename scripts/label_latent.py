@@ -41,7 +41,6 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import sys
-from time import perf_counter
 import zipfile
 
 import numpy as np
@@ -51,18 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from rynnlam.inference import RynnLAMEncoder, file_sha256, implementation_sha256
 from rynnlam.prefetch import PrefetchedBatches
-from rynnlam.timing import format_timings, timed
 from rynnlam.video import BUCKETS, FrameReader, VideoSeekError, pair_batches, resolve_source
-
-BATCH_TIMING_STAGES = (
-    "open_video", "seek", "decode", "rgb", "resize", "pack_batch", "pack_batch_cpu", "prefetch_wait",
-    "transfer_in", "input_check", "forward", "readout", "transfer_out", "encode_wall", "latent_post",
-)
-VIEW_TIMING_STAGES = (
-    "probe_output", "resolve_source", *BATCH_TIMING_STAGES, "serialize_npz", "write_npz",
-)
-SKIP_TIMING_STAGES = ("probe_output", "resolve_source", "verify_existing")
-SETUP_TIMING_STAGES = ("read_manifests", "checkpoint_hash", "implementation_hash", "load_model")
 
 
 def safe_name(value, *, nested=False):
@@ -82,50 +70,17 @@ def safe_name(value, *, nested=False):
     return value
 
 
-def label_video(encoder, video, protocol, *, view, batch_size, timings=None, timing_every=0,
-                label_name=None, prepared=None):
+def label_video(encoder, video, protocol, *, view, batch_size, prepared=None):
     """Encode every (t, t+gap) pair of one video; return (latent, pair_indices, meta)."""
-    if timing_every and timings is None:
-        timings = Counter()
-    options = dict(view=view, batch_size=batch_size, timings=timings,
-                   timing_every=timing_every, label_name=label_name)
     try:
-        return _encode_video(encoder, video, protocol, seek=True, prepared=prepared, **options)
+        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size,
+                             seek=True, prepared=prepared)
     except VideoSeekError as exc:
         print(f"[decode] {video}: {exc}. Retrying the window with sequential decoding.", flush=True)
-        return _encode_video(encoder, video, protocol, seek=False, **options)
+        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size, seek=False)
 
 
-def _encode_batch(encoder, images, representation, timings):
-    if timings is None:
-        return encoder(images, representation=representation).cpu().numpy()
-
-    with timed(timings, "encode_wall"):
-        stream = torch.cuda.current_stream(encoder.device) if encoder.device.type == "cuda" else None
-        marks = []
-
-        def mark(stage):
-            if stream is None:
-                stamp = perf_counter()
-            else:
-                stamp = torch.cuda.Event(enable_timing=True)
-                stamp.record(stream)
-            marks.append((stage, stamp))
-
-        tokens = encoder(images, representation=representation, mark=mark)
-        mark("transfer_out")
-        result = tokens.cpu().numpy()
-        mark(None)
-        if stream is not None:
-            # The copy to CPU already blocks. Wait for the trailing event before reading the
-            # measurements so pending forward kernels do not get attributed to the copy.
-            marks[-1][1].synchronize()
-        for (stage, start), (_, end) in zip(marks, marks[1:]):
-            timings[stage] += end - start if stream is None else start.elapsed_time(end) / 1000
-    return result
-
-
-def _video_batches(video, protocol, view, batch_size, seek, timings, *, buffer_count=1):
+def _video_batches(video, protocol, view, batch_size, seek, *, buffer_count=1):
     reader = FrameReader(video, view)
     batches = pair_batches(
         reader,
@@ -136,56 +91,38 @@ def _video_batches(video, protocol, view, batch_size, seek, timings, *, buffer_c
         end=protocol["end_frame"],
         pair_stride=protocol["pair_stride"],
         seek=seek,
-        timings=timings,
         reuse_buffer=True,
         buffer_count=buffer_count,
     )
     return reader, batches
 
 
-def _encode_video(encoder, video, protocol, *, view, batch_size, seek,
-                  timings=None, timing_every=0, label_name=None, prepared=None):
+def _encode_video(encoder, video, protocol, *, view, batch_size, seek, prepared=None):
     if prepared is None:
-        reader, batches = _video_batches(video, protocol, view, batch_size, seek, timings)
+        reader, batches = _video_batches(video, protocol, view, batch_size, seek)
     else:
         reader, prefetch = prepared
-        batches = prefetch.consume(timings)
+        batches = prefetch.consume()
     latents, pair_indices = [], []
     shape = bucket = native_hw = None
-    if timing_every:
-        previous_timings = timings.copy()
-        previous_report = perf_counter()
-        reported_pairs = 0
-    total_pairs = 0
     with closing(batches):
-        for batch_number, (images, pairs, bkt, nhw) in enumerate(batches, 1):
+        for images, pairs, batch_bucket, batch_hw in batches:
             # The copy back to CPU finishes before the next iteration releases the image buffer.
-            tokens = _encode_batch(encoder, images, protocol["representation"], timings)
-            with timed(timings, "latent_post"):
-                current = list(tokens.shape[1:])
-                if shape is not None and current != shape:
-                    raise ValueError("Token shape changed within the video")
-                shape = current
-                encoded = tokens.reshape(len(tokens), -1).astype(np.float16)
-                if not np.isfinite(encoded).all():
-                    raise ValueError("Non-finite values after float16 conversion")
-                latents.append(encoded)
-                pair_indices.append(pairs)
-                bucket, native_hw = bkt, nhw
-            total_pairs += len(pairs)
-            if timing_every and batch_number % timing_every == 0:
-                now = perf_counter()
-                print(f"[timing:batch] {label_name or video} batch={batch_number} "
-                      f"pairs={total_pairs - reported_pairs} wall={now - previous_report:.3f}s "
-                      f"{format_timings(timings - previous_timings, BATCH_TIMING_STAGES)}", flush=True)
-                previous_timings = timings.copy()
-                previous_report = perf_counter()
-                reported_pairs = total_pairs
+            tokens = encoder(images, representation=protocol["representation"]).cpu().numpy()
+            current = list(tokens.shape[1:])
+            if shape is not None and current != shape:
+                raise ValueError("Token shape changed within the video")
+            shape = current
+            encoded = tokens.reshape(len(tokens), -1).astype(np.float16)
+            if not np.isfinite(encoded).all():
+                raise ValueError("Non-finite values after float16 conversion")
+            latents.append(encoded)
+            pair_indices.append(pairs)
+            bucket, native_hw = batch_bucket, batch_hw
     if not latents:
         raise ValueError(f"No frame pairs encoded for {video}")
-    with timed(timings, "latent_post"):
-        latent = np.concatenate(latents).astype(np.float16)
-        pairs = np.concatenate(pair_indices).astype(np.int32)
+    latent = np.concatenate(latents).astype(np.float16)
+    pairs = np.concatenate(pair_indices).astype(np.int32)
     count = len(latent)
     num_frames = reader.num_frames
     meta = {
@@ -204,7 +141,7 @@ def _encode_video(encoder, video, protocol, *, view, batch_size, seek,
     return latent, pairs, meta
 
 
-def write_npz(destination, latent, pairs, meta, *, timings=None):
+def write_npz(destination, latent, pairs, meta):
     """np.savez seeks on write, which FUSE mounts reject; build in memory then write bytes.
 
     The bytes land in a ``.partial`` sibling and are published with ``os.replace``, so this
@@ -214,18 +151,16 @@ def write_npz(destination, latent, pairs, meta, *, timings=None):
     other than this function. Not imported from ``stream_extract_tar.atomic_write`` because that
     module pulls in cv2 and torch at import time, which the labeler does not otherwise need.
     """
-    with timed(timings, "serialize_npz"):
-        buffer = io.BytesIO()
-        np.savez(buffer, latent_action=latent, pair_indices=pairs, meta=json.dumps(meta))
-        payload = buffer.getvalue()
+    buffer = io.BytesIO()
+    np.savez(buffer, latent_action=latent, pair_indices=pairs, meta=json.dumps(meta))
+    payload = buffer.getvalue()
     pending = destination.with_name(f".{destination.name}.{os.getpid()}.partial")
-    with timed(timings, "write_npz"):
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            pending.write_bytes(payload)
-            os.replace(pending, destination)
-        finally:
-            pending.unlink(missing_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pending.write_bytes(payload)
+        os.replace(pending, destination)
+    finally:
+        pending.unlink(missing_ok=True)
 
 
 def _has_label_array(archive, member, shape, dtype):
@@ -312,31 +247,14 @@ def verify_existing_latent(path, meta, protocol, expected_dim):
                          "Use --overwrite or choose a new output directory.")
 
 
-def record_view_timings(totals, timings, started):
-    wall = perf_counter() - started
-    timings["views_wall"] = wall
-    totals.update(timings)
-    return wall
-
-
 @dataclass
 class LabelWindow:
-    name: str
     view: str
     destination: Path
     protocol: dict
-    timings: Counter
-    scan_wall: float
 
 
-def _report_skip(name, timings, started, totals, counts, *, verified):
-    wall = record_view_timings(totals, timings, started)
-    reason = "existing latent verified" if verified else "exists (use --overwrite)"
-    print(f"[skip] {name}: {reason} wall={wall:.3f}s {format_timings(timings, SKIP_TIMING_STAGES)}", flush=True)
-    counts["skipped"] += 1
-
-
-def _pending_episode(item, base, args, protocol_defaults, totals, counts):
+def _pending_episode(item, base, args, protocol_defaults, counts):
     dataset = safe_name(item["dataset"])
     episode = safe_name(item["episode_id"], nested=True)
     windows = []
@@ -345,20 +263,16 @@ def _pending_episode(item, base, args, protocol_defaults, totals, counts):
         safe_name(view)
         if args.views and view not in args.views:
             continue
-        started = perf_counter()
-        timings = Counter()
-        name = f"{dataset}/{episode}/{view}"
         destination = args.output_dir / "latents" / dataset / episode / view / "latent.npz"
-        with timed(timings, "probe_output"):
-            exists = not args.overwrite and destination.exists()
-            existing = read_complete_latent(destination) if exists else None
+        exists = not args.overwrite and destination.exists()
+        existing = read_complete_latent(destination) if exists else None
         if existing is not None and not verify:
-            _report_skip(name, timings, started, totals, counts, verified=False)
+            counts["skipped"] += 1
             continue
         if exists and existing is None:
-            print(f"[relabel] {name}: existing latent.npz is incomplete or unreadable", flush=True)
-        with timed(timings, "resolve_source"):
-            video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
+            print(f"[relabel] {dataset}/{episode}/{view}: existing latent.npz is incomplete or unreadable",
+                  flush=True)
+        video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
         start = int(source_view.get("start_frame", item.get("start_frame", 0)) or 0)
         end = source_view.get("end_frame", item.get("end_frame"))
         protocol = {
@@ -370,13 +284,10 @@ def _pending_episode(item, base, args, protocol_defaults, totals, counts):
         if expected_fps is not None:
             protocol["expected_fps"] = expected_fps
         if existing is not None:
-            with timed(timings, "verify_existing"):
-                verify_existing_latent(destination, existing, protocol, args.expected_latent_dim)
-            _report_skip(name, timings, started, totals, counts, verified=True)
+            verify_existing_latent(destination, existing, protocol, args.expected_latent_dim)
+            counts["skipped"] += 1
             continue
-        windows.append(LabelWindow(name, view, destination, protocol, timings, perf_counter() - started))
-    if windows:
-        print(f"[episode] {dataset}/{episode} pending_views={','.join(window.view for window in windows)}", flush=True)
+        windows.append(LabelWindow(view, destination, protocol))
     return windows
 
 
@@ -396,15 +307,14 @@ def _prepared_windows(windows, executor, workers, batch_size):
                 if window is None:
                     exhausted = True
                     break
-                producer_timings = Counter()
                 reader, batches = _video_batches(
                     window.protocol["source"], window.protocol, window.view, batch_size,
-                    True, producer_timings, buffer_count=PrefetchedBatches.buffer_count,
+                    True, buffer_count=PrefetchedBatches.buffer_count,
                 )
                 prefetch = PrefetchedBatches()
                 # Register before launching so an interrupt always cancels the worker.
                 pending.append((window, (reader, prefetch)))
-                prefetch.start(executor, batches, producer_timings)
+                prefetch.start(executor, batches)
             if pending:
                 yield pending[0]
                 _, prepared = pending.popleft()
@@ -415,25 +325,17 @@ def _prepared_windows(windows, executor, workers, batch_size):
             prepared[1].close()
 
 
-def _episode_jobs(items, base, args, protocol_defaults, totals, counts):
+def _episode_jobs(items, base, args, protocol_defaults, counts):
     workers = args.prefetch_workers
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rynnlam-prep") if workers else nullcontext()
     with pool as executor:
         for item in items:
-            windows = _pending_episode(item, base, args, protocol_defaults, totals, counts)
+            windows = _pending_episode(item, base, args, protocol_defaults, counts)
             with closing(_prepared_windows(windows, executor, workers, args.batch_size)) as jobs:
                 yield from jobs
 
 
-def _report_setup(args, device, item_count, setup):
-    clock = "cuda_stream" if device.type == "cuda" else "wall"
-    print(f"[timing:setup] pid={os.getpid()} device={device} inference_clock={clock} "
-          f"batch_size={args.batch_size} prefetch_workers={args.prefetch_workers} episodes={item_count} "
-          f"{format_timings(setup, SETUP_TIMING_STAGES)}", flush=True)
-
-
 def main(argv=None, *, show_next_steps=True):
-    run_started = perf_counter()
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -469,8 +371,6 @@ def main(argv=None, *, show_next_steps=True):
                         help="Require a one-dimensional latent of this width")
     parser.add_argument("--trust-checkpoint", action="store_true",
                         help="Allow Python object deserialization; only for a trusted checkpoint")
-    parser.add_argument("--timing-every", type=int, default=0, metavar="N",
-                        help="Also print interval timings every N batches per video (0: video summaries only)")
     parser.add_argument("--prefetch-workers", type=int, default=0, metavar="N",
                         help="CPU threads preparing video windows (0: prepare on the inference thread)")
     args = parser.parse_args(argv)
@@ -479,24 +379,17 @@ def main(argv=None, *, show_next_steps=True):
         parser.error("--gap, --pair-stride and --batch-size must be positive")
     if args.expected_latent_dim is not None and args.expected_latent_dim < 1:
         parser.error("--expected-latent-dim must be positive")
-    if args.timing_every < 0:
-        parser.error("--timing-every must be nonnegative")
     if args.prefetch_workers < 0:
         parser.error("--prefetch-workers must be nonnegative")
 
-    setup = Counter()
-    with timed(setup, "read_manifests"):
-        items, base = build_items(args)
-    with timed(setup, "checkpoint_hash"):
-        checkpoint_hash = file_sha256(args.checkpoint)
-    with timed(setup, "implementation_hash"):
-        implementation_hash = implementation_sha256()
-        labeler_hash = file_sha256(Path(__file__).resolve())
+    items, base = build_items(args)
+    checkpoint_hash = file_sha256(args.checkpoint)
+    implementation_hash = implementation_sha256()
+    labeler_hash = file_sha256(Path(__file__).resolve())
     args.output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     encoder = None
     counts = Counter()
-    totals = Counter()
     protocol_defaults = {
         "schema_version": 2, "checkpoint_sha256": checkpoint_hash,
         "implementation_sha256": implementation_hash, "labeler_sha256": labeler_hash,
@@ -504,27 +397,22 @@ def main(argv=None, *, show_next_steps=True):
         "normalization": args.normalization, "representation": args.representation,
         "precision": args.precision, "device": str(device),
     }
-    with closing(_episode_jobs(items, base, args, protocol_defaults, totals, counts)) as jobs:
+    with closing(_episode_jobs(items, base, args, protocol_defaults, counts)) as jobs:
         for window, prepared in jobs:
             if encoder is None:
-                with timed(setup, "load_model"):
-                    encoder = RynnLAMEncoder(
-                        args.checkpoint, device=args.device,
-                        normalize=args.normalization == "imagenet", precision=args.precision,
-                        trust_checkpoint=args.trust_checkpoint, checkpoint_sha256=checkpoint_hash,
-                    )
+                encoder = RynnLAMEncoder(
+                    args.checkpoint, device=args.device,
+                    normalize=args.normalization == "imagenet", precision=args.precision,
+                    trust_checkpoint=args.trust_checkpoint, checkpoint_sha256=checkpoint_hash,
+                )
                 # Equal checkpoints can produce slightly different bf16 results on different GPUs.
                 device_name = (torch.cuda.get_device_name(encoder.device)
                                if encoder.device.type == "cuda" else "cpu")
-                _report_setup(args, encoder.device, len(items), setup)
-            # Count the scan for this view, excluding model loading and earlier views.
-            window_started = perf_counter() - window.scan_wall
-            timings = window.timings
             protocol = window.protocol
             protocol["device_name"] = device_name
             latent, pairs, meta = label_video(
                 encoder, protocol["source"], protocol, view=window.view, batch_size=args.batch_size,
-                timings=timings, timing_every=args.timing_every, label_name=window.name, prepared=prepared,
+                prepared=prepared,
             )
             validate_latent_dim(meta, args.expected_latent_dim, window.destination)
             expected_fps = protocol.get("expected_fps")
@@ -535,24 +423,11 @@ def main(argv=None, *, show_next_steps=True):
                 meta["fps"] = expected_fps
             if args.fps is not None and not meta.get("fps"):
                 meta["fps"] = args.fps
-            write_npz(window.destination, latent, pairs, meta, timings=timings)
+            write_npz(window.destination, latent, pairs, meta)
             counts["labeled"] += 1
-            counts["pairs"] += meta["num_latents"]
-            wall = record_view_timings(totals, timings, window_started)
-            print(f"{window.name}: {meta['num_latents']} latents, "
-                  f"shape={meta['code_shape']} -> {window.destination}", flush=True)
-            print(f"[timing:view] {window.name} start_frame={protocol['start_frame']} frames={meta['num_frames']} "
-                  f"pairs={meta['num_latents']} wall={wall:.3f}s pairs_per_s={meta['num_latents'] / wall:.2f} "
-                  f"{format_timings(timings, VIEW_TIMING_STAGES)}", flush=True)
 
-    if encoder is None:
-        _report_setup(args, device, len(items), setup)
     latents = args.output_dir / "latents"
-    wall = perf_counter() - run_started
-    labeled, skipped, total_pairs = (counts[name] for name in ("labeled", "skipped", "pairs"))
-    print(f"[timing:total] pid={os.getpid()} labeled={labeled} skipped={skipped} pairs={total_pairs} "
-          f"wall={wall:.3f}s pairs_per_s={total_pairs / wall:.2f} "
-          f"{format_timings(totals, ('views_wall', *VIEW_TIMING_STAGES, 'verify_existing'))}", flush=True)
+    labeled, skipped = counts["labeled"], counts["skipped"]
     print(f"\n[label] wrote {labeled} latent.npz ({skipped} skipped) under {latents}")
     if not show_next_steps:
         return

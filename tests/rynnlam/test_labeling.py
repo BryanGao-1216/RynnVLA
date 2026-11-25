@@ -7,7 +7,6 @@ These cover the shared machinery ``scripts/label_latent.py`` is built on --
 """
 
 import json
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
@@ -95,12 +94,9 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
         def __init__(self, *args, **kwargs):
             self.__class__.loads += 1
 
-        def __call__(self, images, representation, *, mark=None):
+        def __call__(self, images, representation):
             assert current_thread() is main_thread()
             self.__class__.calls += 1
-            for stage in ("transfer_in", "input_check", "forward", "readout"):
-                if mark is not None:
-                    mark(stage)
             return torch.from_numpy(images).mean((1, 2, 3, 4))[:, None].expand(-1, 608)
 
     monkeypatch.setattr(labeling, "RynnLAMEncoder", VectorEncoder)
@@ -150,22 +146,12 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     assert item["views"]["global"]["start_frame"] == 5
     assert item["views"]["wrist_left"]["start_frame"] == 6
     assert VectorEncoder.calls == 0
-    assert "[timing:prepare]" in capsys.readouterr().out
+    assert "Wrote episode manifests" in capsys.readouterr().out
 
-    adapter.main(args + ["--timing-every", "1"])
-    report = capsys.readouterr().out.splitlines()
-    assert any(line.startswith("[timing:setup]") and "inference_clock=wall" in line
-               and f"prefetch_workers={workers}" in line for line in report)
-    batches = [line for line in report if line.startswith("[timing:batch]")]
-    views = [line for line in report if line.startswith("[timing:view]")]
-    assert len(batches) == len(views) == 4
-    assert [line.split()[1] for line in views] == [
-        "first/1/global", "first/1/wrist_left", "second/1/global", "second/1/wrist_left",
-    ]
-    assert all("batch=1 pairs=2" in line and "forward=" in line for line in batches)
-    assert all(all(f"{stage}=" in line for stage in labeling.VIEW_TIMING_STAGES) for line in views)
-    assert any(line.startswith("[timing:total]") and "labeled=4 skipped=0 pairs=8" in line for line in report)
-    assert any(line.startswith("[timing:job]") and "import_labeler=" in line for line in report)
+    adapter.main(args)
+    report = capsys.readouterr().out
+    assert "[label] wrote 4 latent.npz (0 skipped)" in report
+    assert "[timing:" not in report
     assert len(list((out / "latents").rglob("latent.npz"))) == 4
     with np.load(out / "latents/second/1/wrist_left/latent.npz", allow_pickle=False) as data:
         np.testing.assert_array_equal(data["pair_indices"], [[0, 2], [2, 4]])
@@ -179,9 +165,7 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     assert VectorEncoder.calls == 4
     assert VectorEncoder.loads == 1
     report = capsys.readouterr().out
-    assert "[timing:batch]" not in report
-    assert "labeled=0 skipped=4 pairs=0" in report
-    assert "verify_existing=" in report
+    assert "[label] wrote 0 latent.npz (4 skipped)" in report
 
     config["rynnlam"]["gap"] = 1
     config_path.write_text(json.dumps(config))
@@ -204,9 +188,6 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
 def test_resume_completes_current_episode_before_next_prefetch(tmp_path, monkeypatch, capsys):
     class ResumeEncoder(FakeEncoder):
         device = torch.device("cpu")
-
-        def __call__(self, images, representation, *, mark=None):
-            return super().__call__(images, representation)
 
     monkeypatch.setattr(labeling, "RynnLAMEncoder", ResumeEncoder)
     checkpoint = tmp_path / "checkpoint.pt"
@@ -256,9 +237,8 @@ def test_resume_completes_current_episode_before_next_prefetch(tmp_path, monkeyp
         assert path.read_bytes() == payload
         assert path.stat().st_mtime_ns == mtime
     report = capsys.readouterr().out
-    assert "[episode] task_01/160 pending_views=global,wrist_right" in report
     assert "[relabel] task_01/160/wrist_right" in report
-    assert "labeled=6 skipped=2" in report
+    assert "[label] wrote 6 latent.npz (2 skipped)" in report
 
 
 class DummyReader:
@@ -315,10 +295,9 @@ def test_batch_buffer_reuse_keeps_input_values_and_independent_indices(end, tiny
     assert [len(batch[0]) for batch in expected] == [10, 10, 4]
     assert not np.shares_memory(expected[0][0], expected[1][0])
 
-    timings = Counter()
     reusable_images = []
     saved_indices = []
-    actual = pair_batches(DummyReader(97), **options, timings=timings, reuse_buffer=True)
+    actual = pair_batches(DummyReader(97), **options, reuse_buffer=True)
     for (images, indices, bucket, hw), (expected_images, expected_indices, *geometry) in zip(
         actual, expected, strict=True,
     ):
@@ -333,8 +312,6 @@ def test_batch_buffer_reuse_keeps_input_values_and_independent_indices(end, tiny
     assert all(np.shares_memory(reusable_images[0], images) for images in reusable_images[1:])
     for indices, batch in zip(saved_indices, expected, strict=True):
         np.testing.assert_array_equal(indices, batch[1])
-    assert timings["pack_batch"] > 0
-    assert timings["pack_batch_cpu"] > 0
 
 
 def test_prefetch_overlaps_with_consumer_without_overwriting_held_batch(tiny_buckets):
@@ -355,8 +332,8 @@ def test_prefetch_overlaps_with_consumer_without_overwriting_held_batch(tiny_buc
             worker_closed.set()
 
     with ThreadPoolExecutor(max_workers=1) as executor:
-        with closing(PrefetchedBatches()) as prepared, closing(prepared.consume(Counter())) as stream:
-            prepared.start(executor, batches(), Counter())
+        with closing(PrefetchedBatches()) as prepared, closing(prepared.consume()) as stream:
+            prepared.start(executor, batches())
             first = next(stream)
             assert second_ready.wait(timeout=3)
             np.testing.assert_array_equal(first[0], expected[0][0])
@@ -494,12 +471,11 @@ def test_labeler_retries_entire_window_after_seek_error(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(video_module, "_seek_video_frames", fail_after_one_pair)
     if with_prefetch:
-        producer_timings = Counter()
-        reader, batches = labeling._video_batches(video, protocol, "head", 1, True, producer_timings,
+        reader, batches = labeling._video_batches(video, protocol, "head", 1, True,
                                                  buffer_count=PrefetchedBatches.buffer_count)
         with ThreadPoolExecutor(max_workers=1) as executor:
             with closing(PrefetchedBatches()) as prefetch:
-                prefetch.start(executor, batches, producer_timings)
+                prefetch.start(executor, batches)
                 latent, pairs, meta = labeling.label_video(
                     encoder, video, protocol, view="head", batch_size=1, prepared=(reader, prefetch),
                 )
