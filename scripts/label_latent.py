@@ -70,14 +70,15 @@ def safe_name(value, *, nested=False):
     return value
 
 
-def label_video(encoder, video, protocol, *, view, batch_size, prepared=None):
+def label_video(encoder, video, protocol, *, view, batch_size, prepared=None, label_name=None):
     """Encode every (t, t+gap) pair of one video; return (latent, pair_indices, meta)."""
     try:
         return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size,
-                             seek=True, prepared=prepared)
+                             seek=True, prepared=prepared, label_name=label_name)
     except VideoSeekError as exc:
         print(f"[decode] {video}: {exc}. Retrying the window with sequential decoding.", flush=True)
-        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size, seek=False)
+        return _encode_video(encoder, video, protocol, view=view, batch_size=batch_size,
+                             seek=False, label_name=label_name)
 
 
 def _video_batches(video, protocol, view, batch_size, seek, *, buffer_count=1):
@@ -97,7 +98,7 @@ def _video_batches(video, protocol, view, batch_size, seek, *, buffer_count=1):
     return reader, batches
 
 
-def _encode_video(encoder, video, protocol, *, view, batch_size, seek, prepared=None):
+def _encode_video(encoder, video, protocol, *, view, batch_size, seek, prepared=None, label_name=None):
     if prepared is None:
         reader, batches = _video_batches(video, protocol, view, batch_size, seek)
     else:
@@ -106,7 +107,7 @@ def _encode_video(encoder, video, protocol, *, view, batch_size, seek, prepared=
     latents, pair_indices = [], []
     shape = bucket = native_hw = None
     with closing(batches):
-        for images, pairs, batch_bucket, batch_hw in batches:
+        for batch_number, (images, pairs, batch_bucket, batch_hw) in enumerate(batches, 1):
             # The copy back to CPU finishes before the next iteration releases the image buffer.
             tokens = encoder(images, representation=protocol["representation"]).cpu().numpy()
             current = list(tokens.shape[1:])
@@ -119,6 +120,8 @@ def _encode_video(encoder, video, protocol, *, view, batch_size, seek, prepared=
             latents.append(encoded)
             pair_indices.append(pairs)
             bucket, native_hw = batch_bucket, batch_hw
+            if label_name is not None:
+                print(f"[batch] {label_name} batch={batch_number} pairs={len(pairs)}", flush=True)
     if not latents:
         raise ValueError(f"No frame pairs encoded for {video}")
     latent = np.concatenate(latents).astype(np.float16)
@@ -249,6 +252,7 @@ def verify_existing_latent(path, meta, protocol, expected_dim):
 
 @dataclass
 class LabelWindow:
+    name: str
     view: str
     destination: Path
     protocol: dict
@@ -263,15 +267,16 @@ def _pending_episode(item, base, args, protocol_defaults, counts):
         safe_name(view)
         if args.views and view not in args.views:
             continue
+        name = f"{dataset}/{episode}/{view}"
         destination = args.output_dir / "latents" / dataset / episode / view / "latent.npz"
         exists = not args.overwrite and destination.exists()
         existing = read_complete_latent(destination) if exists else None
         if existing is not None and not verify:
+            print(f"[skip] {name}: exists (use --overwrite)", flush=True)
             counts["skipped"] += 1
             continue
         if exists and existing is None:
-            print(f"[relabel] {dataset}/{episode}/{view}: existing latent.npz is incomplete or unreadable",
-                  flush=True)
+            print(f"[relabel] {name}: existing latent.npz is incomplete or unreadable", flush=True)
         video, source_size, source_mtime_ns = resolve_source(source_view["video_path"], base)
         start = int(source_view.get("start_frame", item.get("start_frame", 0)) or 0)
         end = source_view.get("end_frame", item.get("end_frame"))
@@ -285,9 +290,10 @@ def _pending_episode(item, base, args, protocol_defaults, counts):
             protocol["expected_fps"] = expected_fps
         if existing is not None:
             verify_existing_latent(destination, existing, protocol, args.expected_latent_dim)
+            print(f"[skip] {name}: existing latent verified", flush=True)
             counts["skipped"] += 1
             continue
-        windows.append(LabelWindow(view, destination, protocol))
+        windows.append(LabelWindow(name, view, destination, protocol))
     return windows
 
 
@@ -412,7 +418,7 @@ def main(argv=None, *, show_next_steps=True):
             protocol["device_name"] = device_name
             latent, pairs, meta = label_video(
                 encoder, protocol["source"], protocol, view=window.view, batch_size=args.batch_size,
-                prepared=prepared,
+                prepared=prepared, label_name=window.name,
             )
             validate_latent_dim(meta, args.expected_latent_dim, window.destination)
             expected_fps = protocol.get("expected_fps")
@@ -425,6 +431,8 @@ def main(argv=None, *, show_next_steps=True):
                 meta["fps"] = args.fps
             write_npz(window.destination, latent, pairs, meta)
             counts["labeled"] += 1
+            print(f"{window.name}: {meta['num_latents']} latents, "
+                  f"shape={meta['code_shape']} -> {window.destination}", flush=True)
 
     latents = args.output_dir / "latents"
     labeled, skipped = counts["labeled"], counts["skipped"]

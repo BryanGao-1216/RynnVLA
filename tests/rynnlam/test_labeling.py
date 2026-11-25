@@ -152,6 +152,12 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     report = capsys.readouterr().out
     assert "[label] wrote 4 latent.npz (0 skipped)" in report
     assert "[timing:" not in report
+    labeled_views = ("first/1/global", "first/1/wrist_left", "second/1/global", "second/1/wrist_left")
+    assert [line for line in report.splitlines() if line.startswith("[batch]")] == [
+        f"[batch] {view} batch=1 pairs=2" for view in labeled_views
+    ]
+    for view in labeled_views:
+        assert f"{view}: 2 latents, shape=[608] -> {out / 'latents' / view / 'latent.npz'}" in report
     assert len(list((out / "latents").rglob("latent.npz"))) == 4
     with np.load(out / "latents/second/1/wrist_left/latent.npz", allow_pickle=False) as data:
         np.testing.assert_array_equal(data["pair_indices"], [[0, 2], [2, 4]])
@@ -166,6 +172,10 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     assert VectorEncoder.loads == 1
     report = capsys.readouterr().out
     assert "[label] wrote 0 latent.npz (4 skipped)" in report
+    assert [line for line in report.splitlines() if line.startswith("[skip]")] == [
+        f"[skip] {view}: existing latent verified" for view in labeled_views
+    ]
+    assert "[batch]" not in report
 
     config["rynnlam"]["gap"] = 1
     config_path.write_text(json.dumps(config))
@@ -237,6 +247,8 @@ def test_resume_completes_current_episode_before_next_prefetch(tmp_path, monkeyp
         assert path.read_bytes() == payload
         assert path.stat().st_mtime_ns == mtime
     report = capsys.readouterr().out
+    assert "[skip] task_01/160/wrist_left: existing latent verified" in report
+    assert "[skip] task_01/160/head: existing latent verified" in report
     assert "[relabel] task_01/160/wrist_right" in report
     assert "[label] wrote 6 latent.npz (2 skipped)" in report
 
