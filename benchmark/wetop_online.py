@@ -108,6 +108,12 @@ def main(argv=None):
         run.error(f"Unable to resolve a Stage 2 model from {TRAINING_CONFIG}: {exc}. Pass --checkpoint.")
     if not all((checkpoint / name).is_file() for name in ("config.json", "processor_config.json")):
         run.error(f"No exported Stage 2 model at {checkpoint}; set RYNNVLA_CHECKPOINT or pass --checkpoint")
+    model_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    if model_config.get("use_latent_actions") is True:
+        run.error(
+            f"{checkpoint} is a Stage 1 latent-action checkpoint. "
+            "Set RYNNVLA_CHECKPOINT in scripts/eval.sh to the exported WET-OP Stage 2 model directory."
+        )
 
     from genmanip_client import EvalClient
     from .wetop_policy import WetopPolicy

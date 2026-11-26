@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from benchmark.wetop_online import run_online
+from benchmark.wetop_online import main, run_online
 from benchmark.wetop_policy import CAMERA_SLOTS, ROBOT_TYPE, WetopPolicy, action_chunk, observations
 
 
@@ -76,6 +76,20 @@ def test_checkpoint_normalization_preserves_all_native_dimensions(monkeypatch):
 
     policy = WetopPolicy("unused", device="cpu", dtype="float32", denoising_steps=3, chunk_size=2)
     np.testing.assert_array_equal(policy(native_observation()), [np.arange(1, 17)] * 2)
+
+
+def test_stage1_checkpoint_is_rejected_before_loading_weights(tmp_path, monkeypatch, capsys):
+    (tmp_path / "config.json").write_text('{"use_latent_actions": true}', encoding="utf-8")
+    (tmp_path / "processor_config.json").write_text('{}', encoding="utf-8")
+    monkeypatch.setenv("EBENCH_SUBMIT_TOKEN", "test-token")
+
+    with pytest.raises(SystemExit) as exc:
+        main(["run", "--checkpoint", str(tmp_path), "--endpoint", "https://example.test", "--run-id", "test"])
+
+    assert exc.value.code == 2
+    message = capsys.readouterr().err
+    assert "Stage 1 latent-action checkpoint" in message
+    assert "exported WET-OP Stage 2 model directory" in message
 
 
 @pytest.mark.parametrize("max_episodes", [0, 1])
