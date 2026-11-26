@@ -526,9 +526,12 @@ class RobotAction(_TensorChunkComposite):
     right_hand: Optional[Position] = None
     torso: Optional[Position] = None
     head: Optional[Position] = None
+    native_vector: Optional[Position] = None
 
     def __post_init__(self):
         super().__post_init__()
+        if self.native_vector is not None and any(name != "native_vector" for name, _ in self._fields()):
+            raise ValueError("A native robot vector cannot be mixed with structured robot fields")
         for grip_name in ("left_gripper", "right_gripper"):
             g = getattr(self, grip_name)
             if g is not None and g.allow_relative:

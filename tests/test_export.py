@@ -41,7 +41,14 @@ class ConfigValidationTests(unittest.TestCase):
     def test_stage2_contract(self):
         preset = json.loads((ROOT / "rynnvla/configs/stage2_v5_4b.json").read_text())
         config = {**stage1_config(), **preset["config_overrides"]}
-        exporter.validate_config(config, preset["processor_overrides"], stage="stage2")
+        for chunk in (10, 12, 30):
+            with self.subTest(chunk=chunk):
+                exporter.validate_config({**config, "action_chunk_size": chunk},
+                                         preset["processor_overrides"], stage="stage2")
+        for chunk in (0, True, 12.5):
+            with self.subTest(chunk=chunk), self.assertRaisesRegex(ValueError, "action_chunk_size"):
+                exporter.validate_config({**config, "action_chunk_size": chunk},
+                                         preset["processor_overrides"], stage="stage2")
         with self.assertRaises(ValueError):
             exporter.validate_config(config, {"use_state": False,
                                               "action_norm_type": "min_max_sym"}, stage="stage2")

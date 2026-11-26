@@ -136,6 +136,7 @@ def test_lerobot_v3_shared_video_windows_and_label_reuse(tmp_path, monkeypatch, 
     }
     if workers:
         config["rynnlam"].update(async_prefetch=True, prefetch_workers=workers)
+        config["rynnvla"] = {"latent_action_dim": 608, "stage1": {"latent_chunk": 2, "latent_step_seconds": 2 / 30}}
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config))
     args = ["--config", str(config_path)]
@@ -251,6 +252,124 @@ def test_resume_completes_current_episode_before_next_prefetch(tmp_path, monkeyp
     assert "[skip] task_01/160/head: existing latent verified" in report
     assert "[relabel] task_01/160/wrist_right" in report
     assert "[label] wrote 6 latent.npz (2 skipped)" in report
+
+
+def test_wetop_config_prepares_both_vla_stages(tmp_path, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from rynnvla.constants import RobotType
+    from rynnvla.datasets.vla_datasets import LatentPretrainDataset, LeRobotV3Dataset
+    from rynnvla.models.rynn_brain_vla.processing_rynn_brain_vla import RynnBrainVLAProcessor
+    from rynnvla.utils.lerobot_v3 import MANIFEST_VIEW
+
+    runner = load_script("train_lerobot_v3")
+    root = tmp_path / "task"
+    cameras = dict(zip(("video.top", "video.left", "video.right", "video.overlook"),
+                       ("head", "left_wrist", "right_wrist", "front_third")))
+    template = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    row = {"episode_index": 2, "length": 40, "tasks": ["Transfer liquid"]}
+    for offset, (key, role) in enumerate(cameras.items(), 1):
+        video = root / template.format(video_key=key, chunk_index=0, file_index=0)
+        video.parent.mkdir(parents=True)
+        write_video(video, n=45)
+        row.update({f"videos/{key}/{field}": value for field, value in zip(
+            ("chunk_index", "file_index", "from_timestamp", "to_timestamp"),
+            (0, 0, offset / 30, (offset + 40) / 30),
+        )})
+        view = MANIFEST_VIEW[role]
+        destination = tmp_path / "labels" / "latents" / "task" / "2" / view / "latent.npz"
+        starts = np.arange(0, 34, 6, dtype=np.int32)
+        label = np.broadcast_to(np.arange(6, dtype=np.float16)[:, None], (6, 608))
+        labeling.write_npz(destination, label, np.stack((starts, starts + 6), axis=-1), {
+            "num_latents": 6, "num_frames": 40, "fps": 30.0, "code_shape": [608],
+            "protocol": {"gap": 6, "pair_stride": 6, "representation": "ktoken_zcam",
+                         "start_frame": offset, "end_frame": offset + 40, "source": str(video)},
+        })
+    episodes = root / "meta/episodes/chunk-000"
+    episodes.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pylist([row]), episodes / "file-000.parquet")
+    (root / "meta/info.json").write_text(json.dumps({
+        "codebase_version": "v3.0", "fps": 30, "video_path": template,
+        "features": {**{key: {"dtype": "video"} for key in cameras},
+                     "state": {"dtype": "float32", "shape": [2]},
+                     "action": {"dtype": "float32", "shape": [3]}},
+    }))
+    frame_dir = root / "data/chunk-000"
+    frame_dir.mkdir(parents=True)
+    # The physical row order and shard boundary must not change the action timeline.
+    for index, frames in enumerate((range(39, 19, -1), range(19, -1, -1))):
+        pq.write_table(pa.table({
+            "episode_index": [2] * 20, "frame_index": list(frames),
+            "state": pa.array([[frame + 0.5, frame + 0.75] for frame in frames], type=pa.list_(pa.float32(), 2)),
+            "action": [[frame, frame + 10, frame + 20] for frame in frames],
+        }), frame_dir / f"file-{index:03d}.parquet", row_group_size=10)
+    config_path = tmp_path / "config.json"
+    config = {
+        "output_dir": "labels",
+        "datasets": [{"name": "task", "path": "task", "episode_indices": [2]}],
+        "dataset_defaults": {"cameras": cameras, "state_key": "state", "action_key": "action", "robot_type": "lift2"},
+        "rynnlam": {"gap": 6, "pair_stride": 6, "representation": "ktoken_zcam"},
+        "rynnvla": {
+            "latent_action_dim": 608, "training_output_dir": "run",
+            "stage1": {"latent_chunk": 6, "latent_step_seconds": 0.2, "pretrained_model_path": "pretrained"},
+            "stage2": {"action_chunk_size": 12},
+        },
+    }
+    config_path.write_text(json.dumps(config))
+    options = ["--config", str(config_path)]
+    for stage in ("stage1", "stage2"):
+        assert runner.main([stage, *options, "--prepare-only"]) == 0
+    work = tmp_path / "run/data"
+    pointer, = work.glob("stage1-*.json")
+    stage1_mixture = Path(json.loads(pointer.read_text())["mixture"])
+    stage2_mixture, = work.glob("stage2-*.json")
+    stage1_data, = json.loads(stage1_mixture.read_text())
+    stage2_data, = json.loads(stage2_mixture.read_text())
+    assert stage1_data.pop("data_type") == "LatentPretrainDataset"
+    assert stage2_data.pop("data_type") == "LeRobotV3Dataset"
+    common = {"use_delta_action": False, "num_view_slots": 6}
+    latent = LatentPretrainDataset(**stage1_data, **common, latent_action_dim=608, action_chunk_size=30)[0]
+    assert latent["latent_targets"].shape == (6, 6, 608)
+    assert latent["slot_mask"].tolist() == [True, True, True, True, False, False]
+    assert {view: int(image[0, 0, 0]) for view, image in latent["images"].items()} == pytest.approx(
+        {"view0": 20, "view1": 40, "view2": 60, "view3": 80}, abs=4
+    )
+    action_chunk_size = config["rynnvla"]["stage2"]["action_chunk_size"]
+    dataset = LeRobotV3Dataset(**stage2_data, **common, action_chunk_size=action_chunk_size, chunk_overlap_ratio=0.5)
+    sample = dataset[1]
+    assert sample["robot_type"] == RobotType.LIFT2
+    assert sample["camera_slot_map"] == latent["camera_slot_map"] == {"view0": 0, "view1": 1, "view2": 2, "view3": 3}
+    torch.testing.assert_close(sample["state"].native_vector.data, torch.tensor([[6.5, 6.75]]))
+    torch.testing.assert_close(sample["action"].native_vector.data[0], torch.tensor([6., 16., 26.]))
+    assert int(sample["images"]["view2"][0, 0, 0]) == pytest.approx(180, abs=4)
+    schema = dataset.get_schema(num_workers=0)
+    processor = object.__new__(RynnBrainVLAProcessor)
+    processor.schema, processor.action_norm_type = schema, "min_max_sym"
+    encoded, mask = processor._process_action(sample["action"], schema["action"]["lift2"])
+    assert encoded.shape == mask.shape == (action_chunk_size, 81)
+    assert mask.sum().item() == 3 * action_chunk_size
+    torch.testing.assert_close(mask, processor.get_action_mask(RobotType.LIFT2, action_chunk_size))
+    decoded = processor.post_process(encoded, RobotType.LIFT2)
+    torch.testing.assert_close(decoded.native_vector.data, sample["action"].native_vector.data)
+
+    calls = []
+    monkeypatch.setattr(runner, "validate_initialization", lambda path: calls.append(path))
+    monkeypatch.setattr(runner.launch, "main", lambda args: calls.append(args) or 0)
+    assert runner.main(["stage1", *options, "--nproc-per-node", "2"]) == 0
+    assert calls[0] == tmp_path / "pretrained"
+    assert str(stage1_mixture) in calls[1]
+    assert "2" in calls[1]
+    assert "--action-chunk-size" not in calls[1]
+    with pytest.raises(FileNotFoundError, match="Stage 1 EMA is missing"):
+        runner.main(["stage2", *options])
+    ema = tmp_path / "run/stage1/ema"
+    ema.mkdir(parents=True)
+    assert runner.main(["stage2", *options]) == 0
+    assert calls[2] == ema
+    assert str(stage2_mixture) in calls[3]
+    command, _ = runner.launch.build_command(calls[3])
+    assert command[command.index("--action_chunk_size") + 1] == str(action_chunk_size)
 
 
 class DummyReader:

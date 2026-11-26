@@ -13,7 +13,7 @@ from PIL import Image
 from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
 from transformers.feature_extraction_utils import BatchFeature
 
-from ...constants import (ALLOWED_ACTION_NORM_TYPES, VIEW_ROLE_LABEL, RobotType,
+from ...constants import (ACTION_DIM, ALLOWED_ACTION_NORM_TYPES, VIEW_ROLE_LABEL, RobotType,
                           RotationRepresentation)
 from ...utils.robot import Arm, Position, Rotation, RobotAction, RobotState
 
@@ -31,10 +31,10 @@ ACTION_LAYOUT: Dict[Union[str, Tuple[str, str]], Tuple[int, int]] = {
     "right_hand":                    (54, 74),
     "torso":                         (74, 78),   # 4 DoF for Astribot humanoid waist
     "head":                          (78, 81),   # 3 DoF max (Astribot uses 2)
+    "native_vector":                 (0, ACTION_DIM),
 }
-ACTION_DIM = 81
 _TOP_LEVEL_NAMES = (
-    "left_gripper", "right_gripper", "left_hand", "right_hand", "torso", "head",
+    "left_gripper", "right_gripper", "left_hand", "right_hand", "torso", "head", "native_vector",
 )
 
 
@@ -278,6 +278,17 @@ class RynnBrainVLAProcessor(Qwen3VLProcessor):
         out = torch.zeros(chunk_size, ACTION_DIM, dtype=ref.dtype, device=ref.device)
         mask = torch.zeros(chunk_size, ACTION_DIM, dtype=torch.bool, device=ref.device)
 
+        def _fill(slot: Tuple[int, int], value: torch.Tensor) -> None:
+            start, end = slot
+            d = value.size(1)
+            assert d <= end - start, f"dim {d} exceeds slot size {end - start}"
+            out[:, start:start + d] = value
+            mask[:, start:start + d] = True
+
+        if action.native_vector is not None:
+            _fill(ACTION_LAYOUT["native_vector"], action.native_vector.data)
+            return out, mask
+
         # Pre-fill identity rotation into both eef_rotation slots so unused
         # slots stay valid in the configured representation.
         identity_rot = torch.tensor(
@@ -286,13 +297,6 @@ class RynnBrainVLAProcessor(Qwen3VLProcessor):
         for arm_name in ("left_arm", "right_arm"):
             s, _ = ACTION_LAYOUT[(arm_name, "eef_rotation")]
             out[:, s:s + identity_rot.numel()] = identity_rot
-
-        def _fill(slot: Tuple[int, int], value: torch.Tensor) -> None:
-            start, end = slot
-            d = value.size(1)
-            assert d <= end - start, f"dim {d} exceeds slot size {end - start}"
-            out[:, start:start + d] = value
-            mask[:, start:start + d] = True
 
         for arm_name in ("left_arm", "right_arm"):
             arm = getattr(action, arm_name)

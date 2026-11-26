@@ -1,6 +1,7 @@
 {
   "output_dir": "/gaowenbin/datasets/WETOP-Bench-Train-v30/rynn_latents",
   "dataset_defaults": {
+    "robot_type": "lift2",
     "state_key": "state",
     "action_key": "action",
     "cameras": {
@@ -40,8 +41,15 @@
     "bucket": "auto"
   },
   "rynnvla": {
+    "training_output_dir": "/gaowenbin/models/trained_models/RynnVLA-S1",
     "latent_action_dim": 608,
-    "latent_chunk": 6,
-    "latent_step_seconds": 0.25
+    "stage1": {
+      "pretrained_model_path": "/gaowenbin/models/base_models/RynnVLA-Latent-4B",
+      "latent_chunk": 6,
+      "latent_step_seconds": 0.25
+    },
+    "stage2": {
+      "action_chunk_size": 36
+    }
   }
 }

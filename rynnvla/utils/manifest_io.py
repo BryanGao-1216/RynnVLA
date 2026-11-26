@@ -15,9 +15,23 @@ in ``scripts/`` import it, and that package's ``__init__`` pulls in torch.
 """
 
 import json
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Iterator, Optional
 
-__all__ = ["iter_json_array", "iter_jsonl", "iter_manifest", "join_caption", "manifest_format"]
+__all__ = ["iter_json_array", "iter_jsonl", "iter_manifest", "join_caption", "manifest_format", "write_json"]
+
+
+def write_json(path, payload):
+    handle = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def iter_json_array(path: str, chunk_bytes: int = 1 << 25) -> Iterator[dict]:

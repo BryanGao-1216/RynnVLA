@@ -50,6 +50,7 @@ import argparse
 import ast
 import fnmatch
 import json
+import math
 import os
 import struct
 import sys
@@ -307,6 +308,7 @@ class Options:
         self.pair_stride = args.expected_pair_stride
         self.representation = args.expected_representation
         self.default_fps = args.default_fps
+        self.source_gap = getattr(args, "source_gap", None)
 
 
 def rebuild_episode(item: dict, opt: Options) -> Tuple[Optional[dict], List[str]]:
@@ -362,6 +364,15 @@ def rebuild_episode(item: dict, opt: Options) -> Tuple[Optional[dict], List[str]
         protocol = meta.get("protocol") or {}
         shape = meta.get("code_shape") or []
         num_latents = meta.get("num_latents")
+        if opt.source_gap is not None:
+            start, end, source_fps = (source[key] for key in ("start_frame", "end_frame", "expected_fps"))
+            expected_count = 1 + (end - start - opt.source_gap - 1) // opt.pair_stride
+            if (protocol.get("gap") != opt.source_gap
+                    or protocol.get("start_frame") != start or protocol.get("end_frame") != end
+                    or protocol.get("source") != os.path.realpath(source["video_path"])
+                    or not math.isclose(float(meta.get("fps") or 0), source_fps, rel_tol=1e-3)
+                    or num_latents != expected_count):
+                return None, ["source_window_mismatch"]
         if not num_latents or int(num_latents) < 1:
             return None, ["bad_num_latents"]
         if len(shape) != 1 or (opt.latent_dim and int(shape[0]) != opt.latent_dim):

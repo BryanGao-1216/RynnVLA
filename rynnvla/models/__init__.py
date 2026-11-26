@@ -274,10 +274,16 @@ def _load_pretrained_weights(
         original_state_dict = model.state_dict(**state_dict_args)
 
         if mpu.get_data_parallel_rank() == 0 and tie_word_embeddings and head_key in original_state_dict:
-            assert embedding_key not in missing_keys
-            assert head_key in missing_keys
-            missing_keys.remove(head_key)
-            state_dict[head_key].copy_(state_dict[embedding_key])
+            if embedding_key in missing_keys:
+                if head_key in missing_keys:
+                    raise ValueError("Checkpoint is missing both tied token embeddings and the language head")
+                state_dict[embedding_key].copy_(state_dict[head_key])
+                missing_keys.remove(embedding_key)
+            else:
+                # HF saves may omit the tied alias, while the explicit exporter saves both.
+                state_dict[head_key].copy_(state_dict[embedding_key])
+                if head_key in missing_keys:
+                    missing_keys.remove(head_key)
             if embedding_key not in original_state_dict:
                 state_dict.pop(embedding_key)
 

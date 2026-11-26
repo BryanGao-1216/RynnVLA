@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from rynnvla import models
 
@@ -67,3 +68,25 @@ def test_stage_transfer_rejects_missing_pretrained_modules(monkeypatch, missing)
     model = _transfer_model()
     with pytest.raises(ValueError, match="Incomplete RynnVLA checkpoint transfer"):
         models._load_pretrained_weights(model, model.state_dict(), "stage1")
+
+
+@pytest.mark.parametrize("save_embedding,save_head", [(True, False), (False, True), (True, True)])
+def test_exported_checkpoint_tied_aliases(tmp_path, monkeypatch, save_embedding, save_head):
+    monkeypatch.setattr(models.AutoConfig, "from_pretrained", lambda path: SimpleNamespace(
+        model_type="rynn_brain_vla", tie_word_embeddings=True, use_latent_actions=True
+    ))
+    model = torch.nn.Module()
+    model.base_model_prefix = "model"
+    model.config = SimpleNamespace(use_latent_head_readout=False)
+    model.model = torch.nn.Module()
+    model.model.language_model = torch.nn.Module()
+    model.model.language_model.embed_tokens = torch.nn.Embedding(2, 3)
+    model.lm_head = torch.nn.Linear(3, 2, bias=False)
+    expected = torch.arange(6).reshape(2, 3).float()
+    keys = ["model.language_model.embed_tokens.weight", "lm_head.weight"]
+    save_file({key: expected.clone() for key, save in zip(keys, (save_embedding, save_head)) if save},
+              tmp_path / "model.safetensors")
+
+    assert models._load_pretrained_weights(model, model.state_dict(), str(tmp_path)) == []
+    for key in keys:
+        torch.testing.assert_close(model.state_dict()[key], expected)

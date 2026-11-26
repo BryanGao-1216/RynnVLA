@@ -61,6 +61,7 @@ class RobotType(Enum):
     PIPER = "piper"
     ARX_LIFT2 = "arx_lift2"
     LEROBOT = "lerobot"
+    LIFT2 = "lift2"
     AGIBOT_G2 = "agibot_g2"
     AGIBOT_G1 = "agibot_g1"
     SPLIT_ALOHA = "split_aloha"
@@ -88,6 +89,7 @@ ROBOT_TYPE_TO_EE_ID = {
     RobotType.ARX_X5: 1,
     RobotType.ARX_LIFT2: 1,
     RobotType.LEROBOT: 1,
+    RobotType.LIFT2: 2,
     RobotType.GALAXEA_R1_LITE: 1,
     RobotType.ARK: 1,
     RobotType.TIANYI: 1,
@@ -204,6 +206,7 @@ VIEW_ROLE_LABEL = {
 # outside [-1, 1], and heavy-tailed dims get a larger normalized range than under
 # min_max_sym. Pick it for parity with a recipe that used it, not because it bounds the target.
 ALLOWED_ACTION_NORM_TYPES = ("mean_std", "min_max", "min_max_sym", "q01_q99")
+ACTION_DIM = 81
 
 
 class RotationRepresentation(Enum):

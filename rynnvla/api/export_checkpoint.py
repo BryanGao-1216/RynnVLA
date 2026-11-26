@@ -52,19 +52,13 @@ def validate_config(config, processor, stage="stage1"):
     for key, value in expected.items():
         if config.get(key) != value:
             raise ValueError(f"{stage} config mismatch: {key}={config.get(key)!r}, expected {value!r}")
-    # Stage-1 is chunk30. Stage-2's formal recipe is chunk10, but chunk size is a real lever on
-    # VLABench, where the chunk30 arms materially outperform chunk10. Stage-2 chunk30 arms
-    # therefore have to be exportable, or a long run finishes and cannot be evaluated.
-    _ALLOWED_STAGE2_CHUNKS = (10, 30)
+    # Stage 2 generates positions and noise for the configured chunk at runtime.
     chunk = config.get("action_chunk_size")
     if stage == "stage1":
         if chunk != 30:
             raise ValueError(f"stage1 config mismatch: action_chunk_size={chunk!r}, expected 30")
-    elif chunk not in _ALLOWED_STAGE2_CHUNKS:
-        raise ValueError(
-            f"stage2 config mismatch: action_chunk_size={chunk!r} "
-            f"(expected one of {', '.join(map(str, _ALLOWED_STAGE2_CHUNKS))})"
-        )
+    elif type(chunk) is not int or chunk < 1:
+        raise ValueError(f"stage2 config mismatch: action_chunk_size={chunk!r}, expected a positive integer")
     if config.get("text_config", {}).get("hidden_size") != backbone_width:
         size = "2B" if backbone_width == 2048 else "4B"
         raise ValueError(f"Expected a {size} backbone (text_config.hidden_size={backbone_width})")
