@@ -152,6 +152,13 @@ def validate_initialization(model):
         raise ValueError(f"No RynnVLA model weights or weight index in {model}")
 
 
+def stage_output_path(settings, stage):
+    output_dir = settings.get(stage, {}).get("output_dir")
+    if output_dir is not None:
+        return Path(output_dir)
+    return Path(settings["training_output_dir"]) / stage
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("stage1", "stage2"))
@@ -170,24 +177,30 @@ def main(argv=None):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config_dir = config_path.parent
     settings = config["rynnvla"]
-    training = resolve_path(config_dir, settings["training_output_dir"])
+    output_dir = resolve_path(config_dir, stage_output_path(settings, args.stage))
     stage_args = []
     if args.stage == "stage1":
-        model = resolve_path(config_dir, settings.get("stage1", settings)["pretrained_model_path"])
+        model_path = settings.get("stage1", settings)["pretrained_model_path"]
     else:
-        model = training / "stage1" / "ema"
         stage2 = settings.get("stage2", {})
+        model_path = stage2.get("pretrained_model_path")
+        if model_path is None:
+            model_path = stage_output_path(settings, "stage1") / "ema"
         if "action_chunk_size" in stage2:
             chunk_size = stage2["action_chunk_size"]
             if type(chunk_size) is not int or chunk_size < 1:
                 parser.error("rynnvla.stage2.action_chunk_size must be a positive integer")
             stage_args.extend(("--action-chunk-size", str(chunk_size)))
+    model = resolve_path(config_dir, model_path)
     if not args.prepare_only and not args.resume:
-        if args.stage == "stage2" and not model.is_dir():
-            raise FileNotFoundError(f"Stage 1 EMA is missing at {model}. Finish Stage 1 first.")
+        if not model.is_dir():
+            raise FileNotFoundError(f"{args.stage} pretrained model directory is missing: {model}")
         validate_initialization(model)
     datasets = list(dataset_specs(config, config_dir))
-    work = training / "data"
+    prepared_data_dir = settings.get("prepared_data_dir")
+    if prepared_data_dir is None:
+        prepared_data_dir = Path(settings["training_output_dir"]) / "data"
+    work = resolve_path(config_dir, prepared_data_dir)
     work.mkdir(parents=True, exist_ok=True)
     mixture = (stage1_mix(config, datasets, config_dir, work, rebuild=args.rebuild_data, resume=args.resume)
                if args.stage == "stage1" else stage2_mix(datasets, work))
@@ -196,7 +209,7 @@ def main(argv=None):
         return 0
     return launch.main([
         "--stage", args.stage, "--model-path", str(model), "--data-mixture", str(mixture),
-        "--output-dir", str(training / args.stage), *(["--resume"] if args.resume else []),
+        "--output-dir", str(output_dir), *(["--resume"] if args.resume else []),
         *stage_args, *overrides,
     ])
 

@@ -100,7 +100,7 @@ The `state_key` and `action_key` fields are checked against the dataset schema. 
 
 ### Train RynnVLA on the LeRobot v3 dataset
 
-The WETOP launch uses the same [config.json](configs/config.json) as labeling. Set `rynnvla.stage1.pretrained_model_path` to the downloaded RynnVLA-Latent-4B directory and `rynnvla.training_output_dir` to the root for data preparation and the two runs.
+The WETOP launch uses the same [config.json](configs/config.json) as labeling. Each of `rynnvla.stage1` and `rynnvla.stage2` has its own `pretrained_model_path` and `output_dir`. The two stages store their prepared data under `rynnvla.prepared_data_dir`.
 
 ```bash
 bash scripts/train_lerobot_v3.sh
@@ -108,9 +108,9 @@ bash scripts/train_lerobot_v3.sh
 
 Run from the repository root. Edit the script to select GPUs with `CUDA_VISIBLE_DEVICES`, match `--nproc-per-node` to the GPU count, or change `stage1` to `stage2`.
 
-Stage 1 builds the latent manifest, index and normalization statistics under `training_output_dir/data` from the existing `output_dir/latents` tree. Each episode needs a matching label window for every selected camera and enough supervision for a complete latent chunk. The launcher reports the episodes excluded per subset. Set `rynnvla.stage1.latent_stats_path` to reuse the original mean and standard deviation if available. The launcher reuses a prepared snapshot for the same config. After adding or regenerating labels, run `python scripts/train_lerobot_v3.py stage1 --prepare-only --rebuild-data` before starting a new Stage 1 run.
+Stage 1 builds the latent manifest, index and normalization statistics under `rynnvla.prepared_data_dir` from the existing `output_dir/latents` tree. Each episode needs a matching label window for every selected camera and enough supervision for a complete latent chunk. The launcher reports the episodes excluded per subset. Set `rynnvla.stage1.latent_stats_path` to reuse the original mean and standard deviation if available. The launcher reuses a prepared snapshot for the same config. After adding or regenerating labels, run `python scripts/train_lerobot_v3.py stage1 --prepare-only --rebuild-data` before starting a new Stage 1 run.
 
-Stage 1 initializes from the downloaded 4B checkpoint and saves its final EMA model to `training_output_dir/stage1/ema`. Stage 2 initializes a new run from that export and saves under `training_output_dir/stage2`. It uses the configured camera roles and the native `state_key` and `action_key` vectors from the shared Parquet shards. Preparation matches rows by episode and frame index and caches the two columns as memory-mapped arrays. Run `python scripts/train_lerobot_v3.py stage2 --prepare-only` to build this cache before launching. Training preserves the vector component order and computes action loss on the populated dimensions. Set `rynnvla.stage2.action_chunk_size` to the number of consecutive actions per chunk at the native frame rate. The supplied config uses 10. Add `--resume` to the Python command to continue a stopped run within the same stage.
+Stage 1 initializes from the downloaded 4B checkpoint and saves its final EMA model in the `ema/` subdirectory of `rynnvla.stage1.output_dir`. Set `rynnvla.stage2.pretrained_model_path` to that EMA directory or another compatible Stage 1 export. Stage 2 uses the configured camera roles and the native `state_key` and `action_key` vectors from the shared Parquet shards. Preparation matches rows by episode and frame index and caches the two columns as memory-mapped arrays. Run `python scripts/train_lerobot_v3.py stage2 --prepare-only` to build this cache before launching. Training preserves the vector component order and computes action loss on the populated dimensions. Set `rynnvla.stage2.action_chunk_size` to the number of consecutive actions per chunk at the native frame rate. Add `--resume` to the Python command to continue a stopped run within the same stage.
 
 ### Launch Commands
 

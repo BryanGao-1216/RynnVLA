@@ -311,16 +311,18 @@ def test_wetop_config_prepares_both_vla_stages(tmp_path, monkeypatch):
         "dataset_defaults": {"cameras": cameras, "state_key": "state", "action_key": "action", "robot_type": "lift2"},
         "rynnlam": {"gap": 6, "pair_stride": 6, "representation": "ktoken_zcam"},
         "rynnvla": {
-            "latent_action_dim": 608, "training_output_dir": "run",
-            "stage1": {"latent_chunk": 6, "latent_step_seconds": 0.2, "pretrained_model_path": "pretrained"},
-            "stage2": {"action_chunk_size": 12},
+            "latent_action_dim": 608, "prepared_data_dir": "prepared",
+            "stage1": {"latent_chunk": 6, "latent_step_seconds": 0.2,
+                       "pretrained_model_path": "pretrained", "output_dir": "runs/latent"},
+            "stage2": {"action_chunk_size": 12,
+                       "pretrained_model_path": "exports/stage1-ema", "output_dir": "runs/actions"},
         },
     }
     config_path.write_text(json.dumps(config))
     options = ["--config", str(config_path)]
     for stage in ("stage1", "stage2"):
         assert runner.main([stage, *options, "--prepare-only"]) == 0
-    work = tmp_path / "run/data"
+    work = tmp_path / "prepared"
     pointer, = work.glob("stage1-*.json")
     stage1_mixture = Path(json.loads(pointer.read_text())["mixture"])
     stage2_mixture, = work.glob("stage2-*.json")
@@ -356,17 +358,21 @@ def test_wetop_config_prepares_both_vla_stages(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(runner, "validate_initialization", lambda path: calls.append(path))
     monkeypatch.setattr(runner.launch, "main", lambda args: calls.append(args) or 0)
+    (tmp_path / "pretrained").mkdir()
     assert runner.main(["stage1", *options, "--nproc-per-node", "2"]) == 0
     assert calls[0] == tmp_path / "pretrained"
+    assert calls[1][calls[1].index("--output-dir") + 1] == str(tmp_path / "runs/latent")
     assert str(stage1_mixture) in calls[1]
     assert "2" in calls[1]
     assert "--action-chunk-size" not in calls[1]
-    with pytest.raises(FileNotFoundError, match="Stage 1 EMA is missing"):
+    with pytest.raises(FileNotFoundError, match="stage2 pretrained model directory is missing.*exports/stage1-ema"):
         runner.main(["stage2", *options])
-    ema = tmp_path / "run/stage1/ema"
+    ema = tmp_path / "exports/stage1-ema"
     ema.mkdir(parents=True)
     assert runner.main(["stage2", *options]) == 0
     assert calls[2] == ema
+    assert calls[3][calls[3].index("--model-path") + 1] == str(ema)
+    assert calls[3][calls[3].index("--output-dir") + 1] == str(tmp_path / "runs/actions")
     assert str(stage2_mixture) in calls[3]
     command, _ = runner.launch.build_command(calls[3])
     assert command[command.index("--action_chunk_size") + 1] == str(action_chunk_size)

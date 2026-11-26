@@ -41,14 +41,17 @@
     "bucket": "auto"
   },
   "rynnvla": {
-    "training_output_dir": "/gaowenbin/models/trained_models/RynnVLA-S1",
+    "prepared_data_dir": "/gaowenbin/models/trained_models/RynnVLA/data",
     "latent_action_dim": 608,
     "stage1": {
       "pretrained_model_path": "/gaowenbin/models/base_models/RynnVLA-Latent-4B",
+      "output_dir": "/gaowenbin/models/trained_models/RynnVLA/stage1",
       "latent_chunk": 6,
       "latent_step_seconds": 0.25
     },
     "stage2": {
+      "pretrained_model_path": "/gaowenbin/models/trained_models/RynnVLA/stage1/ema",
+      "output_dir": "/gaowenbin/models/trained_models/RynnVLA/stage2",
       "action_chunk_size": 36
     }
   }
