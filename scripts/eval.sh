@@ -10,5 +10,5 @@ python -m benchmark.wetop_online run \
   --checkpoint "$RYNNVLA_CHECKPOINT" \
   --endpoint "$EBENCH_ONLINE_ENDPOINT" \
   --run-id "$EBENCH_TASK_ID" \
-  --worker-id 0 \
+  --worker-id 8 \
   --max-episodes 10
