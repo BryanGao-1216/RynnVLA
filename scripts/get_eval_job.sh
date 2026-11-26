@@ -6,8 +6,8 @@ gmp online submit \
   --base_url https://internrobotics.shlab.org.cn/eval \
   --token "$EBENCH_SUBMIT_TOKEN" \
   --benchmark_set wet_op_bench_test \
-  --model_name AgentVLA \
-  --model_type agentVLA \
-  --submitter_name test \
-  --submitter_homepage test \
+  --model_name RynnVLA \
+  --model_type VLA \
+  --submitter_name smoke \
+  --submitter_homepage smoke \
   --is_public 0
