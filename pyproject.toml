@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 preprocess = ["zarr>=2.16", "numcodecs>=0.12,<0.16"]
+swanlab = ["swanlab[dashboard]>=0.10.6"]
 # zarr>=3 only where it is installable: zarr 3.x requires Python >=3.11, and this package
 # supports 3.10. The EgoVerse Zarr-v3 reader needs it, so on 3.10 that path is unavailable and
 # its tests skip (importorskip minversion='3.0') rather than silently passing. The runtime

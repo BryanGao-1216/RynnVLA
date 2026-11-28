@@ -4,6 +4,8 @@
 # attribution is recorded in NOTICE.
 # Upstream reference: src/transformers/models/qwen3_vl/configuration_qwen3_vl.py
 
+import json
+
 from transformers.models.qwen3_vl import Qwen3VLConfig
 
 
@@ -248,6 +250,15 @@ class RynnBrainVLAConfig(Qwen3VLConfig):
     @latent_action_chunk_size.setter
     def latent_action_chunk_size(self, value):
         self.__dict__["_latent_action_chunk_size"] = value
+
+    def __repr__(self):
+        if not self.use_latent_actions or self._latent_action_chunk_size is None:
+            return super().__repr__()
+        # The Stage 2 initializer still checks this field in serialized Stage 1 configs.
+        config = self.to_diff_dict()
+        config.pop("action_chunk_size", None)
+        display = json.dumps(self._encode_special_floats(config), indent=2, sort_keys=True)
+        return f"{type(self).__name__} {display}\n"
 
     def to_dict(self):
         out = super().to_dict()

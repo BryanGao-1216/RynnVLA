@@ -50,7 +50,7 @@
       "latent_step_seconds": 0.25
     },
     "stage2": {
-      "pretrained_model_path": "/gaowenbin/models/trained_models/RynnVLA/stage1/ema",
+      "pretrained_model_path": "/gaowenbin/models/trained_models/RynnVLA/stage1",
       "output_dir": "/gaowenbin/models/trained_models/RynnVLA/stage2",
       "action_chunk_size": 36
     }

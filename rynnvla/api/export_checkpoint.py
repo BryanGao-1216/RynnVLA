@@ -44,7 +44,7 @@ def validate_config(config, processor, stage="stage1"):
         "expert_per_layer_adanorm": True, "expert_time_concat": True,
         "expert_train_repeat": 1, "time_conditioning": "adaln",
         "num_view_slots": 6, "latent_action_dim": 608,
-        "latent_action_chunk_size": 6, "latent_action_stride": 5,
+        "latent_action_chunk_size": 6,
         "use_latent_actions": stage == "stage1",
         "use_latent_head_readout": stage == "stage2",
         "use_view_cond_slots": True,
@@ -52,13 +52,12 @@ def validate_config(config, processor, stage="stage1"):
     for key, value in expected.items():
         if config.get(key) != value:
             raise ValueError(f"{stage} config mismatch: {key}={config.get(key)!r}, expected {value!r}")
-    # Stage 2 generates positions and noise for the configured chunk at runtime.
-    chunk = config.get("action_chunk_size")
-    if stage == "stage1":
-        if chunk != 30:
-            raise ValueError(f"stage1 config mismatch: action_chunk_size={chunk!r}, expected 30")
-    elif type(chunk) is not int or chunk < 1:
-        raise ValueError(f"stage2 config mismatch: action_chunk_size={chunk!r}, expected a positive integer")
+    # These values are independent of the weight tensor shapes. Stage 2 sets its
+    # real-action chunk from the training arguments when it builds the model.
+    for key in ("latent_action_stride", "action_chunk_size"):
+        value = config.get(key)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{stage} config mismatch: {key}={value!r}, expected a positive integer")
     if config.get("text_config", {}).get("hidden_size") != backbone_width:
         size = "2B" if backbone_width == 2048 else "4B"
         raise ValueError(f"Expected a {size} backbone (text_config.hidden_size={backbone_width})")

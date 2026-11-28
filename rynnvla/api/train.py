@@ -266,12 +266,25 @@ def resolve_resume(values, resume, find_checkpoint):
 def train(argv=None):
     values, resume = parse_training_options(argv)
     validate_options(values)
+    is_main_process = int(os.environ.get("RANK", 0)) == 0
     # Every torchrun worker ran this before, which broke multinode: node 0's Trainer creates the
     # output directory shortly after starting, so workers on a node that came up later saw it
     # already there and aborted. Only global rank 0 owns the directory. RANK is unset for a
     # direct single-process invocation, where the check must still apply.
-    if int(os.environ.get("RANK", 0)) == 0:
+    if is_main_process:
         check_output_dir(values["output_dir"], resume=resume)
+
+    swanlab = None
+    callbacks = []
+    if is_main_process and os.environ.get("SWANLAB_MODE", "disabled") != "disabled":
+        try:
+            import swanlab
+            from swanlab.integration.transformers import SwanLabCallback
+        except ModuleNotFoundError as exc:
+            if exc.name != "swanlab":
+                raise
+            raise RuntimeError("SwanLab logging requires `python -m pip install '.[swanlab]'`.") from exc
+        callbacks.append(SwanLabCallback())
 
     from transformers.trainer_utils import enable_full_determinism, set_seed
     from ..arguments import TrainingArguments
@@ -340,9 +353,12 @@ def train(argv=None):
     data_collator = DataCollator(processor=processor, sequence_packing=args.sequence_packing)
     trainer = Trainer(
         model=model, args=args, data_collator=data_collator,
-        train_dataset=train_dataset, processing_class=processor,
+        train_dataset=train_dataset, processing_class=processor, callbacks=callbacks,
     )
-    return trainer.train(resume_from_checkpoint=checkpoint)
+    result = trainer.train(resume_from_checkpoint=checkpoint)
+    if swanlab is not None:
+        swanlab.finish()
+    return result
 
 
 if __name__ == "__main__":

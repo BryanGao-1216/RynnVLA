@@ -23,16 +23,26 @@ def stage1_config():
 class ConfigValidationTests(unittest.TestCase):
     def test_stage1_contract_not_training_step(self):
         exporter.validate_config(stage1_config(), {"use_state": False})
+        for stride, chunk in ((5, 30), (6, 30), (6, 36)):
+            with self.subTest(stride=stride, chunk=chunk):
+                exporter.validate_config(
+                    {**stage1_config(), "latent_action_stride": stride, "action_chunk_size": chunk},
+                    {"use_state": False},
+                )
         for key, value in {
             "expert_hidden_size": 1024, "expert_intermediate_size": 4096,
             "expert_backbone": "custom", "expert_time_concat": False,
             "expert_num_foresight_tokens": 50, "num_view_slots": 5,
             "latent_action_dim": 128, "latent_action_chunk_size": 5,
-            "latent_action_stride": 1, "use_view_cond_slots": False,
+            "use_view_cond_slots": False,
             "use_latent_head_readout": True, "use_sf_align": True,
         }.items():
             with self.subTest(key=key), self.assertRaises(ValueError):
                 exporter.validate_config({**stage1_config(), key: value}, {"use_state": False})
+        for key in ("latent_action_stride", "action_chunk_size"):
+            for value in (None, 0, True, 6.5):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    exporter.validate_config({**stage1_config(), key: value}, {"use_state": False})
         with self.assertRaises(ValueError):
             exporter.validate_config(stage1_config(), {"use_state": True})
         with self.assertRaisesRegex(ValueError, "4B"):
@@ -41,7 +51,7 @@ class ConfigValidationTests(unittest.TestCase):
     def test_stage2_contract(self):
         preset = json.loads((ROOT / "rynnvla/configs/stage2_v5_4b.json").read_text())
         config = {**stage1_config(), **preset["config_overrides"]}
-        for chunk in (10, 12, 30):
+        for chunk in (10, 12, 30, 36):
             with self.subTest(chunk=chunk):
                 exporter.validate_config({**config, "action_chunk_size": chunk},
                                          preset["processor_overrides"], stage="stage2")
